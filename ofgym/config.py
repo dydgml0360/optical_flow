@@ -30,6 +30,8 @@ class Paths:
     raw: Path      # 캡처 원본
     recon: Path    # make3D 재구성 결과 (스테이징 + model/)
     gt: Path       # 생성된 disparity ground truth
+    flow: Path     # 합성 촬영 쌍 + optical flow ground truth
+    shared: Path   # 디바이스 UI 가 남긴 record (아틀라스 + 정점맵) 공유 폴더
     runs: Path
     depth: Path
 
@@ -42,6 +44,8 @@ class Paths:
             raw=dataset / "raw",
             recon=dataset / "recon",
             gt=dataset / "gt",
+            flow=dataset / "flow",
+            shared=_env_path("OFGYM_SHARED", (REPO_ROOT / ".." / "shared").resolve()),
             runs=REPO_ROOT / "runs",
             depth=REPO_ROOT / "thirdparty" / "depth",
         )
