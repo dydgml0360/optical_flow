@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import cv2
 import numpy as np
 import yaml
 
@@ -21,6 +22,7 @@ _FALLBACK_FOCAL = 423.7465 * 6
 _FALLBACK_SIZE = (3040, 4032)
 _FALLBACK_PRINCIPAL = (237.0 * 6, 337.71 * 6)
 _FALLBACK_BASELINE = 15.0
+_FALLBACK_RADIUS = 265.02
 
 
 @dataclass(frozen=True)
@@ -115,6 +117,15 @@ def device_baseline() -> float:
         return _FALLBACK_BASELINE
 
 
+def device_radius() -> float:
+    """카메라가 도는 원의 반지름 (mm) — 회전축은 center 카메라 앞 이 거리에 있다."""
+    try:
+        with (PATHS.depth / "config" / "stereo.yaml").open(encoding="utf-8") as fh:
+            return float((yaml.safe_load(fh) or {})["radius"])
+    except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError):
+        return _FALLBACK_RADIUS
+
+
 # ── 자세 ──────────────────────────────────────────────────────────────────
 def rotation(yaw: float, pitch: float, roll: float) -> np.ndarray:
     """도 단위. yaw 는 Y(세로축), pitch 는 X, roll 은 Z(시선축) 회전."""
@@ -126,13 +137,43 @@ def rotation(yaw: float, pitch: float, roll: float) -> np.ndarray:
     return rz @ rx @ ry
 
 
-def place(center: np.ndarray, offset, yaw: float, pitch: float, roll: float) -> np.ndarray:
-    """`center` 를 축으로 돌린 뒤 `offset` 만큼 옮기는 4x4 모델 행렬."""
-    center = np.asarray(center, np.float64)
-    rot = rotation(yaw, pitch, roll)
+def rodrigues(rvec_deg) -> np.ndarray:
+    """회전 벡터(축 × 각, **도**) → 3x3. 크기만 도 단위일 뿐 OpenCV 의 rvec 과 같다."""
+    rvec = np.radians(np.asarray(rvec_deg, np.float64)).reshape(3, 1)
+    return cv2.Rodrigues(rvec)[0]
+
+
+def rigid(rvec_deg, tvec) -> np.ndarray:
+    """`X' = R(rvec) X + tvec` 인 4x4."""
     matrix = np.eye(4)
-    matrix[:3, :3] = rot
-    matrix[:3, 3] = center + np.asarray(offset, np.float64) - rot @ center
+    matrix[:3, :3] = rodrigues(rvec_deg)
+    matrix[:3, 3] = np.asarray(tvec, np.float64)
+    return matrix
+
+
+def place(center: np.ndarray, rvec_deg, tvec) -> np.ndarray:
+    """`center` 를 축으로 `rvec` 만큼 돌린 뒤 `tvec` 만큼 옮기는 4x4 모델 행렬."""
+    center = np.asarray(center, np.float64)
+    matrix = rigid(rvec_deg, (0, 0, 0))
+    matrix[:3, 3] = center + np.asarray(tvec, np.float64) - matrix[:3, :3] @ center
+    return matrix
+
+
+def orbit(angle_deg: float, radius: float) -> np.ndarray:
+    """회전축 둘레 `angle_deg` 자리에 선 카메라의 world→camera.
+
+    디바이스와 같은 규약이다 (`atlas_builder._camera_centers`, 펌웨어 angles=[50, 0, -50]):
+    회전축은 월드 (0, 0, radius) 를 지나는 세로축이고, left=+50°, center=0°, right=-50°.
+    어느 자리에서든 회전축은 카메라 좌표 (0, 0, radius) 에 온다.
+    """
+    t = np.radians(-angle_deg)
+    rot = np.array([[np.cos(t), 0.0, np.sin(t)],
+                    [0.0, 1.0, 0.0],
+                    [-np.sin(t), 0.0, np.cos(t)]])
+    pivot = np.array([0.0, 0.0, radius])
+    matrix = np.eye(4)
+    matrix[:3, :3] = rot.T
+    matrix[:3, 3] = -rot.T @ (pivot - rot @ pivot)
     return matrix
 
 

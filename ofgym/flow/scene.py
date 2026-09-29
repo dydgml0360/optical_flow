@@ -3,13 +3,20 @@
 월드 좌표계는 캡처 좌표계 그대로다 (center 카메라가 원점, +Z 앞, +Y 아래, mm).
 모든 값이 0 인 기본 씬은 디바이스가 실제로 찍던 배치를 재현한다.
 
+카메라는 디바이스처럼 회전축 둘레의 세 자리(left +50° / center 0° / right -50°) 중
+하나에 서고, 거기서 `tvec`/`rvec` 만큼 흔들린다. 얼굴도 제자리에서 `tvec`/`rvec` 만큼
+움직인다. 둘 다 OpenCV 와 같은 뜻이다 (`X' = R(rvec) X + tvec`, rvec 은 도 단위).
+
+    카메라   world→camera = [rvec|tvec] · orbit(촬영 위치)     ← 카메라 좌표계에서 흔든다
+    얼굴     object→world = 메쉬 중심을 축으로 rvec, 그 뒤 tvec  ← 월드 좌표계에서 움직인다
+
 촬영은 스테레오처럼 한다: 첫 카메라를 놓고, **기선만큼 평행 이동**한 자리에서 한 장 더.
 씬은 그사이 움직이지 않으므로 flow 는 시차(disparity)와 같고 기선 방향으로만 생긴다.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from typing import Optional, Tuple
 
 import cv2
@@ -35,19 +42,31 @@ AXIS_HORIZONTAL = "가로"
 _AXES = {AXIS_VERTICAL: (0.0, -1.0, 0.0), AXIS_HORIZONTAL: (1.0, 0.0, 0.0)}
 
 
+# 촬영 위치. 디바이스 펌웨어의 angles=[50, 0, -50] 과 같다.
+VIEW_ANGLES = {"left (+50°)": 50.0, "center (0°)": 0.0, "right (-50°)": -50.0}
+
+
 @dataclass
 class SceneParams:
     # 카메라
     scale: float = 0.25  # 디바이스 해상도 대비
     baseline_mm: float = 15.0
     baseline_axis: str = AXIS_VERTICAL
-    # 얼굴 배치 — 캡처된 자리에서 얼마나 옮기고 돌렸는지
-    offset_x: float = 0.0
-    offset_y: float = 0.0
-    offset_z: float = 0.0
-    yaw: float = 0.0
-    pitch: float = 0.0
-    roll: float = 0.0
+    view_angle: float = 0.0  # 촬영 위치, 도
+    # 카메라 흔들림 — 촬영 위치의 카메라 좌표계 기준
+    camera_tx: float = 0.0
+    camera_ty: float = 0.0
+    camera_tz: float = 0.0
+    camera_rx: float = 0.0
+    camera_ry: float = 0.0
+    camera_rz: float = 0.0
+    # 얼굴 움직임 — 캡처된 자리 기준, 월드 좌표계
+    face_tx: float = 0.0
+    face_ty: float = 0.0
+    face_tz: float = 0.0
+    face_rx: float = 0.0
+    face_ry: float = 0.0
+    face_rz: float = 0.0
     # 배경
     background: str = BACKGROUND_NOISE
     background_z: float = 600.0
@@ -58,21 +77,48 @@ class SceneParams:
         axis = np.array(_AXES.get(self.baseline_axis, _AXES[AXIS_VERTICAL]))
         return axis * self.baseline_mm
 
+    @property
+    def camera_tvec(self) -> Tuple[float, float, float]:
+        return (self.camera_tx, self.camera_ty, self.camera_tz)
+
+    @property
+    def camera_rvec(self) -> Tuple[float, float, float]:
+        return (self.camera_rx, self.camera_ry, self.camera_rz)
+
+    @property
+    def face_tvec(self) -> Tuple[float, float, float]:
+        return (self.face_tx, self.face_ty, self.face_tz)
+
+    @property
+    def face_rvec(self) -> Tuple[float, float, float]:
+        return (self.face_rx, self.face_ry, self.face_rz)
+
     def as_dict(self) -> dict:
         return asdict(self)
 
 
-# FlyingThings 처럼 자세를 흩뜨릴 범위 (±). 얼굴이 화면을 벗어나지 않을 만큼으로 잡았다.
-RANDOM_RANGE = dict(offset_x=35.0, offset_y=35.0, yaw=30.0, pitch=18.0, roll=20.0)
-RANDOM_OFFSET_Z = (-40.0, 140.0)
+@dataclass
+class RandomRanges:
+    """무작위 배치의 범위. 성분마다 ±값 안에서 고르게 뽑는다."""
+
+    camera_t: float = 5.0  # mm
+    camera_r: float = 2.0  # 도
+    face_t: float = 10.0  # mm
+    face_r: float = 5.0  # 도
+    random_view: bool = True  # 촬영 위치도 세 자리 중에서 뽑는다
 
 
-def randomized(params: SceneParams, rng: np.random.Generator) -> SceneParams:
-    """카메라·배경 종류는 두고 얼굴 자세와 배경 무늬만 새로 뽑는다."""
+def randomized(params: SceneParams, ranges: RandomRanges,
+               rng: np.random.Generator) -> SceneParams:
+    """카메라 흔들림·얼굴 움직임·배경 무늬를 새로 뽑는다. 해상도·기선·배경 종류는 둔다."""
     values = params.as_dict()
-    for key, limit in RANDOM_RANGE.items():
-        values[key] = float(rng.uniform(-limit, limit))
-    values["offset_z"] = float(rng.uniform(*RANDOM_OFFSET_Z))
+    for prefix, limit_t, limit_r in (("camera", ranges.camera_t, ranges.camera_r),
+                                     ("face", ranges.face_t, ranges.face_r)):
+        for axis in "xyz":
+            values[f"{prefix}_t{axis}"] = float(rng.uniform(-limit_t, limit_t))
+            values[f"{prefix}_r{axis}"] = float(rng.uniform(-limit_r, limit_r))
+    if ranges.random_view:
+        values["view_angle"] = float(rng.choice(list(VIEW_ANGLES.values())))
     values["background_seed"] = int(rng.integers(0, 2**31 - 1))
     return SceneParams(**values)
 
@@ -137,18 +183,23 @@ class Scene:
     def camera(self, params: SceneParams) -> Camera:
         return self._base_camera.scaled(params.scale)
 
+    @property
+    def pivot_radius(self) -> float:
+        return self._mesh.pivot_radius if self._mesh is not None else cam.device_radius()
+
+    def station(self, angle: float) -> np.ndarray:
+        """촬영 위치에 흔들림 없이 선 카메라의 world→camera."""
+        return cam.orbit(angle, self.pivot_radius)
+
     def extrinsics(self, params: SceneParams) -> Tuple[np.ndarray, np.ndarray]:
-        first = np.eye(4)
+        first = cam.rigid(params.camera_rvec, params.camera_tvec) @ self.station(
+            params.view_angle)
         return first, cam.shifted(first, params.baseline_vector())
 
     def face_model(self, params: SceneParams) -> np.ndarray:
         if self._mesh is None:
             return np.eye(4)
-        return cam.place(
-            self._mesh.center,
-            (params.offset_x, params.offset_y, params.offset_z),
-            params.yaw, params.pitch, params.roll,
-        )
+        return cam.place(self._mesh.center, params.face_rvec, params.face_tvec)
 
     def models(self, params: SceneParams) -> dict:
         self._sync_background(params)
@@ -156,13 +207,14 @@ class Scene:
         if self._mesh is not None:
             models[FACE_ID] = self.face_model(params)
         if self._renderer.has_object(BACKGROUND_ID):
-            models[BACKGROUND_ID] = np.eye(4)
+            # 배경판은 촬영 위치의 카메라를 마주 본다 (카메라가 흔들려도 판은 그대로다).
+            models[BACKGROUND_ID] = np.linalg.inv(self.station(params.view_angle))
         return models
 
     def _sync_background(self, params: SceneParams) -> None:
         key = (params.background, round(params.background_z, 3), params.background_seed,
                params.background_image, params.scale, params.baseline_mm,
-               params.baseline_axis)
+               params.baseline_axis, params.camera_tvec, params.camera_rvec)
         if key == self._background_key:
             return
         self._background_key = key
@@ -184,8 +236,11 @@ class Scene:
 
         # 두 카메라의 시야를 다 덮는 판. 주점이 중앙이 아니어도 모자라지 않게 넉넉히 잡는다.
         camera = self.camera(params)
-        z = params.background_z
-        reach = abs(params.baseline_mm) + 1.0
+        z = params.background_z  # 판 좌표계(= 촬영 위치의 카메라 좌표계)에서의 거리
+        # 카메라가 옮겨지고 돌아간 만큼 시야가 판 위에서 밀린다.
+        turn = np.radians(min(float(np.linalg.norm(params.camera_rvec)), 60.0))
+        reach = (abs(params.baseline_mm) + float(np.linalg.norm(params.camera_tvec))
+                 + z * np.tan(turn) + 1.0)
         half_w = z * camera.width / camera.fx * 0.75 + reach
         half_h = z * camera.height / camera.fy * 0.75 + reach
         # 사진이 찌그러지지 않게 판의 비율을 텍스처에 맞춘다 (모자란 쪽을 키운다).
@@ -212,11 +267,18 @@ class Scene:
         return Shot(first=first, second=second, gt=compute_flow(first, second), params=params)
 
     def overview(self, params: SceneParams, viewer: Camera, extrinsic: np.ndarray) -> np.ndarray:
-        """씬을 바깥에서 본 그림. 카메라 두 대의 시야를 선으로 같이 그린다."""
+        """씬을 바깥에서 본 그림. 카메라 두 대의 시야를 선으로 같이 그린다.
+
+        회색은 세 촬영 위치(흔들림 없는 자리)다.
+        """
         camera = self.camera(params)
         extrinsic1, extrinsic2 = self.extrinsics(params)
         depth = 60.0
         lines = [
+            (cam.frustum_lines(camera, self.station(angle), depth * 0.6), (0.42, 0.42, 0.45))
+            for angle in VIEW_ANGLES.values()
+        ]
+        lines += [
             (cam.frustum_lines(camera, extrinsic1, depth), (1.0, 0.82, 0.25)),
             (cam.frustum_lines(camera, extrinsic2, depth), (0.35, 0.8, 1.0)),
         ]

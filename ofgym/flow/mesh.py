@@ -49,6 +49,7 @@ class Mesh:
     center: np.ndarray  # (3,) float32 — 회전·배치의 기준점
     radius: float  # center 에서 가장 먼 정점까지, mm
     step_mm: float
+    pivot_radius: float  # 카메라 회전축까지의 거리 (meta 의 rr), mm
 
     @property
     def bounds(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -197,4 +198,5 @@ def build_mesh(record: Record, step_mm: float = DEFAULT_STEP_MM) -> Mesh:
         center=center,
         radius=float(np.linalg.norm(vertices - center, axis=1).max()),
         step_mm=step * meta["z_rate"],
+        pivot_radius=float(meta["rr"]),
     )
