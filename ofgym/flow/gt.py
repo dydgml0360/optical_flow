@@ -15,14 +15,14 @@ flow 는 **계산**한다 — 첫 프레임의 픽셀이 본 표면점을 두 �
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import cv2
 import numpy as np
 
-from ofgym.flow.renderer import Frame
+from ofgym.flow.renderer import Frame, PairFrame
 
 # 가려짐 판정 여유. 두 번째 프레임에서 다시 본 깊이가 그 자리 깊이보다 이만큼 넘게 멀면 가려진 것.
 OCCLUSION_TOLERANCE_MM = 0.05
@@ -37,24 +37,32 @@ class FlowGT:
     occluded: np.ndarray  # (H,W) bool
     valid: np.ndarray  # (H,W) bool
     depth: np.ndarray  # (H,W) float32, mm. surface 밖은 0
+    _stats: Optional[Dict[str, float]] = field(default=None, repr=False, compare=False)
 
     def stats(self) -> Dict[str, float]:
+        """한 번 계산해 기억해 둔다 — 저장과 목록이 같은 값을 쓴다."""
+        if self._stats is not None:
+            return self._stats
         out = {
-            "surface": float(self.surface.mean()),
-            "valid": float(self.valid.mean()),
-            "occluded": float((self.occluded & self.surface).mean()),
+            "surface": float(np.count_nonzero(self.surface)) / self.surface.size,
+            "valid": float(np.count_nonzero(self.valid)) / self.valid.size,
+            "occluded": float(np.count_nonzero(self.occluded)) / self.occluded.size,
         }
-        if self.valid.any():
-            magnitude = np.linalg.norm(self.flow[self.valid], axis=1)
+        if out["valid"] > 0:
+            u = self.flow[..., 0][self.valid]
+            v = self.flow[..., 1][self.valid]
+            depth = self.depth[self.valid]
+            magnitude = np.hypot(u, v)
             out.update(
                 flow_min=float(magnitude.min()),
-                flow_mean=float(magnitude.mean()),
+                flow_mean=float(magnitude.mean(dtype=np.float64)),
                 flow_max=float(magnitude.max()),
-                u_mean=float(self.flow[self.valid][:, 0].mean()),
-                v_mean=float(self.flow[self.valid][:, 1].mean()),
-                depth_min=float(self.depth[self.valid].min()),
-                depth_max=float(self.depth[self.valid].max()),
+                u_mean=float(u.mean(dtype=np.float64)),
+                v_mean=float(v.mean(dtype=np.float64)),
+                depth_min=float(depth.min()),
+                depth_max=float(depth.max()),
             )
+        self._stats = out
         return out
 
 
@@ -67,11 +75,12 @@ def compute_flow(first: Frame, second: Frame) -> FlowGT:
     there = first.points_in(second.extrinsic, second.models)
     u2, v2, z2 = second.camera.project(there)
 
-    uu, vv = np.meshgrid(np.arange(width, dtype=np.float64),
-                         np.arange(height, dtype=np.float64))
+    # 빈 픽셀은 points_in 이 0 으로 두므로 투영이 (cx, cy) 가 된다 — 마스크로 0 을 채운다.
     flow = np.zeros((height, width, 2), np.float32)
-    flow[..., 0] = np.where(surface, u2 - uu, 0.0)
-    flow[..., 1] = np.where(surface, v2 - vv, 0.0)
+    np.subtract(u2, np.arange(width, dtype=np.float64)[None, :], out=u2)
+    np.subtract(v2, np.arange(height, dtype=np.float64)[:, None], out=v2)
+    np.copyto(flow[..., 0], u2, where=surface, casting="same_kind")
+    np.copyto(flow[..., 1], v2, where=surface, casting="same_kind")
 
     # 두 번째 프레임에서 그 자리에 실제로 찍힌 깊이. 픽셀 하나 안에서도 표면이 기울면
     # 깊이가 달라지므로 3x3 이웃의 가장 먼 값과 비교한다 — 보이는 점은 이웃 범위 안에 든다.
@@ -80,11 +89,13 @@ def compute_flow(first: Frame, second: Frame) -> FlowGT:
     finite = np.where(np.isfinite(depth2), depth2, np.float64(1e12))
     farthest = cv2.dilate(finite, np.ones((3, 3), np.uint8))
 
-    ui = np.rint(u2).astype(np.int64)
-    vi = np.rint(v2).astype(np.int64)
+    # u2, v2 는 이제 flow 다. 도착한 픽셀은 제자리 + flow 를 반올림한 곳.
+    ui = np.rint(u2).astype(np.int32) + np.arange(width, dtype=np.int32)[None, :]
+    vi = np.rint(v2).astype(np.int32) + np.arange(height, dtype=np.int32)[:, None]
     inside = surface & (z2 > 0) & (ui >= 0) & (ui < width) & (vi >= 0) & (vi < height)
-    seen = np.zeros((height, width), bool)
-    seen[inside] = z2[inside] <= farthest[vi[inside], ui[inside]] + OCCLUSION_TOLERANCE_MM
+    np.clip(ui, 0, width - 1, out=ui)
+    np.clip(vi, 0, height - 1, out=vi)
+    seen = inside & (z2 <= farthest[vi, ui] + OCCLUSION_TOLERANCE_MM)
 
     occluded = surface & ~seen
     return FlowGT(
@@ -93,6 +104,20 @@ def compute_flow(first: Frame, second: Frame) -> FlowGT:
         occluded=occluded,
         valid=surface & seen,
         depth=np.where(surface, here[..., 2], 0.0).astype(np.float32),
+    )
+
+
+def flow_from_pair(pair: PairFrame) -> FlowGT:
+    """GPU 가 계산해 온 것을 `compute_flow` 와 같은 모양으로 푼다. 배열은 복사하지 않는다."""
+    state = pair.raw[..., 3]
+    surface = state >= 0.75  # 번호는 1 부터다
+    occluded = surface & ((state - np.floor(state)) > 0.25)
+    return FlowGT(
+        flow=pair.raw[..., :2],
+        surface=surface,
+        occluded=occluded,
+        valid=surface & ~occluded,
+        depth=pair.raw[..., 2],
     )
 
 
@@ -197,7 +222,7 @@ def write_flo(path: Path, flow: np.ndarray) -> None:
     with open(path, "wb") as fh:
         np.array([_FLO_MAGIC], np.float32).tofile(fh)
         np.array([width, height], np.int32).tofile(fh)
-        flow.astype(np.float32).tofile(fh)
+        np.ascontiguousarray(flow, np.float32).tofile(fh)
 
 
 def read_flo(path: Path) -> np.ndarray:
@@ -210,33 +235,44 @@ def read_flo(path: Path) -> np.ndarray:
 
 
 def save_sample(directory: Path, first: Frame, second: Frame, gt: FlowGT,
-                meta: dict) -> Path:
+                meta: dict, depth: bool = True) -> Path:
+    """CPU 경로로 찍은 한 쌍을 쓴다. 파일은 `save_pair` 참고."""
+    return save_pair(
+        directory, first.color, second.color, gt, first.camera,
+        first.extrinsic, second.extrinsic, first.models, second.models, meta, depth,
+    )
+
+
+def save_pair(directory: Path, color1: np.ndarray, color2: np.ndarray, gt: FlowGT,
+              camera, extrinsic1, extrinsic2, models1: dict, models2: dict,
+              meta: dict, depth: bool = True) -> Path:
     """한 쌍을 `directory` 에 쓴다.
 
         img1.png img2.png   사진
         flow.flo            img1 → img2, 픽셀
         valid.png           255 = 손실에 쓸 픽셀
         occluded.png        255 = img2 에서 안 보이는 픽셀
-        depth.npy           img1 의 카메라 Z (mm), float32
+        depth.npy           img1 의 카메라 Z (mm), float32  (`depth=False` 면 생략)
         meta.json           카메라·자세·기선
     """
     directory.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(directory / "img1.png"), cv2.cvtColor(first.color, cv2.COLOR_RGB2BGR))
-    cv2.imwrite(str(directory / "img2.png"), cv2.cvtColor(second.color, cv2.COLOR_RGB2BGR))
+    # PNG 압축 단계는 OpenCV 기본값을 둔다 — 재 보니 단계 1 이 오히려 느렸다 (22ms 대 15ms).
+    cv2.imwrite(str(directory / "img1.png"), cv2.cvtColor(color1, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(str(directory / "img2.png"), cv2.cvtColor(color2, cv2.COLOR_RGB2BGR))
     write_flo(directory / "flow.flo", gt.flow)
-    cv2.imwrite(str(directory / "valid.png"), gt.valid.astype(np.uint8) * 255)
-    cv2.imwrite(str(directory / "occluded.png"), gt.occluded.astype(np.uint8) * 255)
-    np.save(directory / "depth.npy", gt.depth)
+    cv2.imwrite(str(directory / "valid.png"), gt.valid.view(np.uint8) * 255)
+    cv2.imwrite(str(directory / "occluded.png"), gt.occluded.view(np.uint8) * 255)
+    if depth:
+        np.save(directory / "depth.npy", np.ascontiguousarray(gt.depth))
 
-    camera = first.camera
     full = dict(meta)
     full.update(
         camera=dict(width=camera.width, height=camera.height, fx=camera.fx,
                     fy=camera.fy, cx=camera.cx, cy=camera.cy),
-        extrinsic1=first.extrinsic.tolist(),
-        extrinsic2=second.extrinsic.tolist(),
-        models1={str(k): v.tolist() for k, v in first.models.items()},
-        models2={str(k): v.tolist() for k, v in second.models.items()},
+        extrinsic1=np.asarray(extrinsic1).tolist(),
+        extrinsic2=np.asarray(extrinsic2).tolist(),
+        models1={str(k): np.asarray(v).tolist() for k, v in models1.items()},
+        models2={str(k): np.asarray(v).tolist() for k, v in models2.items()},
         stats=gt.stats(),
     )
     (directory / "meta.json").write_text(
