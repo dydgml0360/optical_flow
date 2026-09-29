@@ -106,10 +106,12 @@ def _fill_uncovered(image: np.ndarray, covered: np.ndarray) -> np.ndarray:
         return image
     scale = 8
     small_size = (max(1, image.shape[1] // scale), max(1, image.shape[0] // scale))
-    mask = covered.astype(np.float32)
-    num = cv2.resize(image.astype(np.float32) * mask[..., None], small_size,
-                     interpolation=cv2.INTER_AREA)
-    den = cv2.resize(mask, small_size, interpolation=cv2.INTER_AREA)
+    # 전체 해상도에서는 uint8 로만 다룬다 — 1100만 텍셀을 float 로 바꾸면 그것만 0.3초다.
+    masked = image.copy()
+    masked[~covered] = 0
+    num = cv2.resize(masked, small_size, interpolation=cv2.INTER_AREA).astype(np.float32)
+    den = cv2.resize(covered.astype(np.uint8) * 255, small_size,
+                     interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
 
     filled = np.zeros_like(num)
     known = np.zeros_like(den)
@@ -120,11 +122,10 @@ def _fill_uncovered(image: np.ndarray, covered: np.ndarray) -> np.ndarray:
         filled[take] = blur_num[take] / blur_den[take][:, None]
         known[take] = 1.0
 
-    big = cv2.resize(filled, (image.shape[1], image.shape[0]),
-                     interpolation=cv2.INTER_LINEAR)
-    out = image.copy()
-    out[~covered] = np.clip(big[~covered], 0, 255).astype(np.uint8)
-    return out
+    big = cv2.resize(np.clip(filled, 0, 255).astype(np.uint8),
+                     (image.shape[1], image.shape[0]), interpolation=cv2.INTER_LINEAR)
+    np.copyto(masked, big, where=~covered[..., None])
+    return masked
 
 
 def load_texture(record: Record) -> Tuple[np.ndarray, np.ndarray]:
