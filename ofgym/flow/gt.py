@@ -165,6 +165,14 @@ def flow_to_color(flow: np.ndarray, mask: np.ndarray, max_magnitude: float) -> n
     return out
 
 
+def magnitude_range(flow: np.ndarray, mask: np.ndarray) -> tuple:
+    """`mask` 안 flow 크기의 1~99 백분위 (low, high). 비어 있으면 (0, 1)."""
+    if not mask.any():
+        return 0.0, 1.0
+    low, high = np.percentile(np.linalg.norm(flow[mask], axis=1), [1, 99])
+    return float(low), float(max(high, low + 1e-3))
+
+
 def scalar_to_color(values: np.ndarray, mask: np.ndarray, low: float, high: float,
                     colormap: int = cv2.COLORMAP_TURBO) -> np.ndarray:
     span = max(high - low, 1e-9)
