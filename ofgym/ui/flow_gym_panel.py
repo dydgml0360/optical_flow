@@ -2,7 +2,7 @@
 
     왼쪽    디렉터리 선택 + record 목록
     가운데  3D 씬 (카메라 두 대의 시야 포함) / 촬영 결과 6칸
-    오른쪽  카메라(촬영 위치·흔들림)·얼굴 움직임·무작위 범위·배경 조절, 저장
+    오른쪽  일괄 생성, 카메라(촬영 위치·흔들림)·얼굴 움직임·무작위 범위·배경 조절, 저장
 
 촬영 결과 6칸:
 
@@ -15,11 +15,13 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QImage, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -33,9 +35,11 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QSplitter,
     QTabWidget,
     QVBoxLayout,
@@ -44,6 +48,14 @@ from PySide6.QtWidgets import (
 
 from ofgym.config import PATHS
 from ofgym.flow import gt as flow_gt
+from ofgym.flow.batch import (
+    DEFAULT_PAIRS,
+    BatchResult,
+    BatchSettings,
+    estimate_bytes,
+    free_bytes,
+    run_batch,
+)
 from ofgym.flow.camera import device_baseline
 from ofgym.flow.mesh import build_mesh
 from ofgym.flow.record import Record, find_records
@@ -76,6 +88,36 @@ FLOW_ALL = "크기 — 전체 범위"
 FLOW_WHEEL = "방향·크기 (색상환)"
 
 FREE_VIEW = "자유 시점 (3D 씬)"
+
+
+class BatchThread(QThread):
+    """일괄 생성을 UI 밖에서 돌린다. 실제 일은 `run_batch` 가 띄우는 프로세스들이 한다."""
+
+    progressed = Signal(int, int, str)  # (만든 쌍, 목표, 알릴 말)
+    finishedBatch = Signal(object)  # BatchResult 또는 예외
+
+    def __init__(self, records: List[Record], settings: BatchSettings, output: Path,
+                 parent=None) -> None:
+        super().__init__(parent)
+        self._records = records
+        self._settings = settings
+        self._output = output
+        self._stop = threading.Event()
+
+    def cancel(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:  # noqa: D102 (QThread 규약)
+        try:
+            outcome = run_batch(self._records, self._settings, self._output,
+                                progress=self.progressed.emit, stop=self._stop)
+        except Exception as exc:
+            outcome = exc
+        self.finishedBatch.emit(outcome)
+
+
+def _size_text(count: float) -> str:
+    return f"{count / 1e9:.1f} GB" if count >= 1e9 else f"{count / 1e6:.0f} MB"
 
 
 class ImagePane(QWidget):
@@ -155,6 +197,9 @@ class FlowGymPanel(QWidget):
         self._background_image: Optional[str] = None
         self._background_seed = 0
         self._free_view: Optional[np.ndarray] = None
+        self._records: List[Record] = []
+        self._batch: Optional[BatchThread] = None
+        self._batch_started = 0.0
         self._station_angle = 0.0  # 자유 시점일 때도 기억해 두는 마지막 촬영 위치
         self._rng = np.random.default_rng()
         self._loading = False
@@ -342,6 +387,44 @@ class FlowGymPanel(QWidget):
         background_box = QGroupBox("배경판")
         background_box.setLayout(background_form)
 
+        # 일괄 생성
+        self._batch_total = QSpinBox()
+        self._batch_total.setRange(1, 1_000_000)
+        self._batch_total.setSingleStep(500)
+        self._batch_total.setValue(DEFAULT_PAIRS)
+        self._batch_total.setSuffix(" 쌍")
+        self._batch_total.setGroupSeparatorShown(True)
+        self._batch_total.setToolTip(
+            "목록의 record 전부에 고르게 나눠 만든다. 기본값은 사전학습 모델을 한 도메인에\n"
+            "맞출 때 쓰는 규모다 (KITTI-2015 200쌍, Sintel 1,041쌍)."
+        )
+        self._batch_seed = QSpinBox()
+        self._batch_seed.setRange(0, 2**31 - 1)
+        self._batch_seed.setToolTip("같은 설정과 같은 시드면 같은 쌍들이 나온다")
+        self._batch_depth = QCheckBox("깊이(depth.npy)도 저장")
+        self._batch_info = QLabel("-")
+        self._batch_info.setWordWrap(True)
+        self._batch_info.setStyleSheet("color: palette(mid);")
+        self._batch_bar = QProgressBar()
+        self._batch_bar.setVisible(False)
+        self._batch_button = QPushButton("일괄 생성")
+        self._batch_button.setToolTip(
+            "아래 설정(해상도·기선·배경)과 무작위 범위로, 촬영 위치를 돌아가며 찍는다"
+        )
+        self._batch_button.clicked.connect(self._toggle_batch)
+        self._batch_total.valueChanged.connect(self._update_batch_info)
+        self._batch_depth.toggled.connect(self._update_batch_info)
+
+        batch_form = QFormLayout()
+        batch_form.addRow(self._batch_button)
+        batch_form.addRow("목표", self._batch_total)
+        batch_form.addRow("시드", self._batch_seed)
+        batch_form.addRow(self._batch_depth)
+        batch_form.addRow(self._batch_bar)
+        batch_form.addRow(self._batch_info)
+        batch_box = QGroupBox("일괄 생성 (목록의 record 전부)")
+        batch_box.setLayout(batch_form)
+
         # 저장
         self._save = QPushButton("이 쌍 저장")
         self._save.clicked.connect(self._save_shot)
@@ -364,8 +447,8 @@ class FlowGymPanel(QWidget):
         inner = QWidget()
         layout = QVBoxLayout(inner)
         layout.setContentsMargins(8, 8, 8, 8)
-        for box in (camera_box, jitter_box, pose_box, random_box, background_box,
-                    save_box):
+        for box in (batch_box, camera_box, jitter_box, pose_box, random_box,
+                    background_box, save_box):
             layout.addWidget(box)
         layout.addStretch(1)
 
@@ -374,6 +457,7 @@ class FlowGymPanel(QWidget):
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         scroll.setWidget(inner)
         self._sync_background_widgets()
+        self._update_batch_info()
         return scroll
 
     @staticmethod
@@ -403,6 +487,8 @@ class FlowGymPanel(QWidget):
         self._list.clear()
 
         records = find_records(self._root)
+        self._records = records
+        self._update_batch_info()
         if not records:
             item = QListWidgetItem("아틀라스가 있는 record 가 없습니다")
             item.setFlags(Qt.ItemFlag.NoItemFlags)
@@ -584,6 +670,7 @@ class FlowGymPanel(QWidget):
     def _on_params_changed(self, *_args) -> None:
         self._sync_background_widgets()
         self._sync_view()
+        self._update_batch_info()
         if not self._loading:
             self._pending.start()
 
@@ -672,6 +759,110 @@ class FlowGymPanel(QWidget):
     def _redraw(self, *_args) -> None:
         if self._shot is not None:
             self._show_flow(self._shot)
+
+    # ── 일괄 생성 ─────────────────────────────────────────────────────────
+    def batch_settings(self) -> BatchSettings:
+        return BatchSettings(
+            total=self._batch_total.value(),
+            seed=self._batch_seed.value(),
+            params=self.params(),
+            ranges=self.ranges(),
+            save_depth=self._batch_depth.isChecked(),
+        )
+
+    def _update_batch_info(self, *_args) -> None:
+        if self._batch is not None:
+            return
+        settings = self.batch_settings()
+        camera = Scene.camera_for(settings.params)
+        size = estimate_bytes(settings, camera)
+        per_record = settings.total / max(1, len(self._records))
+        self._batch_info.setText(
+            f"record {len(self._records)}개 × 약 {per_record:.0f}쌍   "
+            f"{camera.width}x{camera.height}\n"
+            f"예상 용량 {_size_text(size)}  (남은 공간 {_size_text(free_bytes(PATHS.flow))})"
+        )
+        self._batch_button.setEnabled(bool(self._records))
+
+    def _toggle_batch(self) -> None:
+        if self._batch is not None:
+            self._batch.cancel()
+            self._batch_button.setEnabled(False)
+            self._batch_button.setText("중지하는 중…")
+            return
+        if not self._records:
+            return
+
+        settings = self.batch_settings()
+        need = estimate_bytes(settings, Scene.camera_for(settings.params))
+        free = free_bytes(PATHS.flow)
+        if need > free * 0.9:
+            self.logMessage.emit(
+                f"[일괄] 디스크가 모자랍니다 — 예상 {_size_text(need)}, 남은 공간 "
+                f"{_size_text(free)}. 목표나 해상도를 줄이세요."
+            )
+            return
+
+        output = PATHS.flow / time.strftime("batch_%Y%m%d_%H%M%S")
+        self._batch = BatchThread(list(self._records), settings, output, self)
+        self._batch.progressed.connect(self._on_batch_progress)
+        self._batch.finishedBatch.connect(self._on_batch_finished)
+        self._batch_started = time.perf_counter()
+        self._batch_bar.setRange(0, settings.total)
+        self._batch_bar.setValue(0)
+        self._batch_bar.setVisible(True)
+        self._batch_button.setText("중지")
+        self._batch_info.setText("프로세스를 띄우는 중…")
+        self.logMessage.emit(
+            f"[일괄] 시작 — {settings.total:,}쌍, record {len(self._records)}개, "
+            f"시드 {settings.seed} → {output}"
+        )
+        self._batch.start()
+
+    def _on_batch_progress(self, done: int, total: int, message: str) -> None:
+        if message:
+            self.logMessage.emit(f"[일괄] {message}")
+        self._batch_bar.setMaximum(max(1, total))
+        self._batch_bar.setValue(done)
+        elapsed = time.perf_counter() - self._batch_started
+        if done > 0 and elapsed > 0:
+            rate = done / elapsed
+            remaining = (total - done) / rate
+            self._batch_info.setText(
+                f"{done:,} / {total:,} 쌍   {rate:.1f} 쌍/초   남은 시간 약 {remaining:.0f}초"
+            )
+
+    def _on_batch_finished(self, outcome) -> None:
+        thread, self._batch = self._batch, None
+        if thread is not None:
+            thread.wait()
+            thread.deleteLater()
+        self._batch_bar.setVisible(False)
+        self._batch_button.setText("일괄 생성")
+        self._update_batch_info()
+
+        if isinstance(outcome, Exception):
+            self.logMessage.emit(f"[일괄] 실패: {outcome}")
+            return
+        result: BatchResult = outcome
+        rate = result.written / result.seconds if result.seconds > 0 else 0.0
+        state = "중지됨" if result.cancelled else "완료"
+        self.logMessage.emit(
+            f"[일괄] {state} — {result.written:,} / {result.requested:,} 쌍, "
+            f"{result.seconds:.0f}초 ({rate:.1f} 쌍/초, 프로세스 {result.workers}개) "
+            f"→ {result.output}"
+        )
+        if result.failed_records:
+            self.logMessage.emit(
+                f"[일괄] 실패한 record {len(result.failed_records)}개: "
+                + ", ".join(r[:8] for r in result.failed_records)
+            )
+
+    def shutdown(self) -> None:
+        """창을 닫을 때. 돌고 있는 일괄 생성을 멈추고 끝나기를 기다린다."""
+        if self._batch is not None:
+            self._batch.cancel()
+            self._batch.wait()
 
     # ── 저장 ──────────────────────────────────────────────────────────────
     def _save_shot(self) -> None:

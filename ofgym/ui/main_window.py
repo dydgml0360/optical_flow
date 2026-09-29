@@ -98,6 +98,10 @@ class MainWindow(QMainWindow):
             f"({'준비됨' if depth_available() else '미체크아웃'})"
         )
 
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self._flow_gym.shutdown()
+        super().closeEvent(event)
+
     def log(self, message: str) -> None:
         self._log.appendPlainText(message)
         first = message.strip().splitlines()[0] if message.strip() else ""
