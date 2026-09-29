@@ -142,7 +142,7 @@ def noise_texture(seed: int, size: int = 1024) -> np.ndarray:
     return (image * 255).astype(np.uint8)
 
 
-def _load_image(path: str) -> Optional[np.ndarray]:
+def load_image(path: str) -> Optional[np.ndarray]:
     bgr = cv2.imread(path, cv2.IMREAD_COLOR)
     if bgr is None:
         return None
@@ -185,6 +185,11 @@ class Scene:
     # ── 구성 요소 ─────────────────────────────────────────────────────────
     def camera(self, params: SceneParams) -> Camera:
         return self._base_camera.scaled(params.scale)
+
+    @staticmethod
+    def camera_for(params: SceneParams) -> Camera:
+        """렌더러 없이 촬영 카메라만 — 크기를 미리 알아야 할 때."""
+        return cam.device_camera().scaled(params.scale)
 
     @property
     def pivot_radius(self) -> float:
@@ -232,7 +237,7 @@ class Scene:
             return
 
         if params.background == BACKGROUND_IMAGE:
-            texture = _load_image(params.background_image) if params.background_image else None
+            texture = load_image(params.background_image) if params.background_image else None
             if texture is None:
                 self.background_error = (
                     f"배경 이미지를 읽지 못했습니다: {params.background_image}"
