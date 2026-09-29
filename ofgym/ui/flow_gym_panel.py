@@ -54,6 +54,7 @@ from ofgym.flow.scene import (
     BACKGROUND_IMAGE,
     BACKGROUND_NOISE,
     BACKGROUND_NONE,
+    FACE_ID,
     VIEW_ANGLES,
     RandomRanges,
     Scene,
@@ -66,7 +67,15 @@ from ofgym.ui.scene_view import SceneView
 RECORD_ROLE = Qt.ItemDataRole.UserRole
 
 PANES = ("사진 1", "사진 2", "flow", "마스크", "되돌린 사진 2", "색 오차")
-ERROR_RANGE = 20.0  # 색 오차 그림에서 가장 밝은 색이 되는 계조 차
+ERROR_RANGE = 5.0  # 색 오차 그림에서 가장 밝은 색이 되는 계조 차
+
+# flow 그림. 스테레오식 촬영은 flow 방향이 한쪽뿐이라 색상환으로는 전부 같은 색이 된다.
+# 그래서 기본은 크기만 색으로 펴서 보여 주고, 범위는 얼굴에 맞춘다.
+FLOW_FACE = "크기 — 얼굴 범위"
+FLOW_ALL = "크기 — 전체 범위"
+FLOW_WHEEL = "방향·크기 (색상환)"
+
+FREE_VIEW = "자유 시점 (3D 씬)"
 
 
 class ImagePane(QWidget):
@@ -145,6 +154,8 @@ class FlowGymPanel(QWidget):
         self._root: Path = PATHS.shared
         self._background_image: Optional[str] = None
         self._background_seed = 0
+        self._free_view: Optional[np.ndarray] = None
+        self._station_angle = 0.0  # 자유 시점일 때도 기억해 두는 마지막 촬영 위치
         self._rng = np.random.default_rng()
         self._loading = False
 
@@ -201,15 +212,41 @@ class FlowGymPanel(QWidget):
             pane = ImagePane(title)
             self._panes[title] = pane
             grid.addWidget(pane, index // 3, index % 3)
+        self._flow_mode = QComboBox()
+        self._flow_mode.addItems([FLOW_FACE, FLOW_ALL, FLOW_WHEEL])
+        self._flow_mode.currentIndexChanged.connect(self._redraw)
+        shots_bar = QHBoxLayout()
+        shots_bar.setContentsMargins(6, 6, 6, 0)
+        shots_bar.addWidget(QLabel("flow 표시"))
+        shots_bar.addWidget(self._flow_mode)
+        shots_bar.addStretch(1)
         shots = QWidget()
-        shots.setLayout(grid)
+        shots_layout = QVBoxLayout(shots)
+        shots_layout.setContentsMargins(0, 0, 0, 0)
+        shots_layout.setSpacing(0)
+        shots_layout.addLayout(shots_bar)
+        shots_layout.addLayout(grid, 1)
+
+        self._shoot_here = QPushButton("현재 위치에서 촬영")
+        self._shoot_here.setToolTip(
+            "지금 3D 씬을 보고 있는 자리에 카메라를 놓고 찍는다 (카메라 흔들림은 0 으로).\n"
+            "사진은 세로로 길다 — 이 화면의 높이만큼이 사진의 폭에 담긴다."
+        )
+        self._shoot_here.setEnabled(False)
+        self._shoot_here.clicked.connect(self._shoot_from_view)
+        scene_tab = QWidget()
+        scene_layout = QVBoxLayout(scene_tab)
+        scene_layout.setContentsMargins(6, 6, 6, 6)
+        scene_layout.addWidget(self._shoot_here)
+        scene_layout.addWidget(self._scene_view, 1)
 
         self._stats = QLabel("-")
         self._stats.setWordWrap(True)
         self._stats.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
         self._tabs = QTabWidget()
-        self._tabs.addTab(self._scene_view, "3D 씬")
+        self._tabs.addTab(scene_tab, "3D 씬")
+        self._shots_tab = shots
         self._tabs.addTab(shots, "촬영 결과")
 
         box = QWidget()
@@ -234,6 +271,7 @@ class FlowGymPanel(QWidget):
         self._view = QComboBox()
         for label, angle in VIEW_ANGLES.items():
             self._view.addItem(label, angle)
+        self._view.addItem(FREE_VIEW, None)
         self._view.setCurrentIndex(list(VIEW_ANGLES.values()).index(0.0))
         self._camera_info = QLabel("-")
         self._camera_info.setStyleSheet("color: palette(mid);")
@@ -419,6 +457,7 @@ class FlowGymPanel(QWidget):
             self._record = None
             self._shot = None
             self._save.setEnabled(False)
+            self._shoot_here.setEnabled(False)
             self._scene_view.set_render(None)
             self._scene_view.set_message(f"불러오기 실패\n{exc}")
             self._record_info.setText(str(exc))
@@ -438,6 +477,7 @@ class FlowGymPanel(QWidget):
         self.logMessage.emit(
             f"[FlowGym] {record.record_id} 메쉬 {len(mesh.faces):,}면  ({record.path})"
         )
+        self._shoot_here.setEnabled(True)
         self._scene_view.set_render(self._render_overview)
         self._scene_view.frame(mesh.center, mesh.radius)
         self._shoot()
@@ -450,7 +490,8 @@ class FlowGymPanel(QWidget):
             scale=float(self._scale.currentData()),
             baseline_mm=self._baseline.value(),
             baseline_axis=self._axis.currentText(),
-            view_angle=float(self._view.currentData()),
+            view_angle=self._station_angle,
+            free_view=self._current_free_view(),
             background=self._background.currentText(),
             background_z=self._background_z.value(),
             background_seed=self._background_seed,
@@ -475,9 +516,14 @@ class FlowGymPanel(QWidget):
                 box.setValue(values[f"camera_{key}"])
             for key, box in self._face_pose.items():
                 box.setValue(values[f"face_{key}"])
-            index = self._view.findData(params.view_angle)
+            if params.free_view is None:
+                index = self._view.findData(params.view_angle)
+            else:
+                index = self._view.findText(FREE_VIEW)
+                self._free_view = np.array(params.free_view, np.float64)
             if index >= 0:
                 self._view.setCurrentIndex(index)
+            self._sync_view()
             self._background_seed = params.background_seed
         finally:
             self._loading = False
@@ -487,8 +533,38 @@ class FlowGymPanel(QWidget):
         self._set_pose(randomized(self.params(), self.ranges(), self._rng))
 
     def _reset_pose(self) -> None:
-        self._set_pose(SceneParams(view_angle=float(self._view.currentData()),
+        self._set_pose(SceneParams(view_angle=self._station_angle,
+                                   free_view=self._current_free_view(),
                                    background_seed=self._background_seed))
+
+    # ── 촬영 위치 / 자유 시점 ──────────────────────────────────────────────
+    def _sync_view(self) -> None:
+        """콤보가 가리키는 것을 상태에 옮긴다. 자유 시점을 처음 고르면 지금 보는 자리를 잡는다."""
+        angle = self._view.currentData()
+        if angle is not None:
+            self._station_angle = float(angle)
+        elif self._free_view is None:
+            self._free_view = self._scene_view.pose()
+
+    def _current_free_view(self):
+        if self._view.currentData() is not None or self._free_view is None:
+            return None
+        return self._free_view.tolist()
+
+    def _shoot_from_view(self) -> None:
+        if self._scene is None or self._scene.mesh is None:
+            return
+        self._free_view = self._scene_view.pose()
+        self._loading = True
+        try:
+            for box in self._camera_pose.values():
+                box.setValue(0.0)
+            self._view.setCurrentIndex(self._view.findText(FREE_VIEW))
+        finally:
+            self._loading = False
+        self._pending.stop()
+        self._shoot()
+        self._tabs.setCurrentWidget(self._shots_tab)
 
     def _sync_background_widgets(self) -> None:
         uses_image = self._background.currentText() == BACKGROUND_IMAGE
@@ -507,6 +583,7 @@ class FlowGymPanel(QWidget):
 
     def _on_params_changed(self, *_args) -> None:
         self._sync_background_widgets()
+        self._sync_view()
         if not self._loading:
             self._pending.start()
 
@@ -543,13 +620,10 @@ class FlowGymPanel(QWidget):
 
         warped = flow_gt.warp_back(shot.second.color, gt.flow)
         error = flow_gt.photometric_error(shot.first.color, warped, gt.valid)
-        magnitude = np.linalg.norm(gt.flow, axis=2)
-        top = float(np.percentile(magnitude[gt.surface], 99)) if gt.surface.any() else 1.0
 
         self._panes["사진 1"].set_image(shot.first.color)
         self._panes["사진 2"].set_image(shot.second.color)
-        self._panes["flow"].set_image(flow_gt.flow_to_color(gt.flow, gt.surface, top))
-        self._panes["flow"].set_caption(f"flow  (채도 최대 = {top:.1f}px)")
+        self._show_flow(shot)
         self._panes["마스크"].set_image(flow_gt.mask_picture(gt))
         self._panes["마스크"].set_caption("마스크  (초록 = 유효, 빨강 = 가려짐)")
         self._panes["되돌린 사진 2"].set_image(warped)
@@ -560,6 +634,7 @@ class FlowGymPanel(QWidget):
 
         self._camera_info.setText(
             f"{camera.width}x{camera.height}  f={camera.fx:.1f}px"
+            + ("  · 자유 시점" if shot.params.free_view is not None else "")
         )
         if "flow_mean" not in stats:
             self._stats.setText("유효한 픽셀이 없습니다 — 얼굴과 배경이 모두 화면 밖입니다")
@@ -574,6 +649,29 @@ class FlowGymPanel(QWidget):
             f"깊이 {stats['depth_min']:.0f} ~ {stats['depth_max']:.0f}mm      "
             f"되돌림 색 오차 평균 {mean_error:.2f} 계조"
         )
+
+    def _show_flow(self, shot: Shot) -> None:
+        gt = shot.gt
+        mode = self._flow_mode.currentText()
+        if mode == FLOW_WHEEL:
+            top = flow_gt.magnitude_range(gt.flow, gt.surface)[1]
+            picture = flow_gt.flow_to_color(gt.flow, gt.surface, top)
+            caption = f"flow  (채도 최대 = {top:.1f}px)"
+        else:
+            face = shot.first.ids == FACE_ID
+            on_face = mode == FLOW_FACE and face.any()
+            low, high = flow_gt.magnitude_range(gt.flow, face if on_face else gt.surface)
+            picture = flow_gt.scalar_to_color(
+                np.linalg.norm(gt.flow, axis=2), gt.surface, low, high
+            )
+            where = "얼굴 기준" if on_face else "전체 기준"
+            caption = f"flow 크기  ({low:.1f} ~ {high:.1f}px, {where})"
+        self._panes["flow"].set_image(picture)
+        self._panes["flow"].set_caption(caption)
+
+    def _redraw(self, *_args) -> None:
+        if self._shot is not None:
+            self._show_flow(self._shot)
 
     # ── 저장 ──────────────────────────────────────────────────────────────
     def _save_shot(self) -> None:

@@ -22,7 +22,9 @@ from ofgym.flow.camera import Camera
 # (관찰 카메라, world→camera) → RGB 그림
 RenderFn = Callable[[Camera, np.ndarray], Optional[np.ndarray]]
 
-_FOCAL_RATIO = 1.4  # 초점거리 / 화면 짧은 변 — 화각 약 40°
+# 초점거리 / 화면 짧은 변. 디바이스 카메라(2542px / 3040px)와 같게 둔다 — 그래야
+# '현재 위치에서 촬영' 한 사진의 폭이 이 화면의 높이만큼을 담아, 보던 크기대로 찍힌다.
+_FOCAL_RATIO = 0.84
 
 
 class SceneView(QWidget):
@@ -59,7 +61,7 @@ class SceneView(QWidget):
     def frame(self, target: np.ndarray, radius: float) -> None:
         """보는 중심과 기본 거리를 잡는다. 카메라 두 대가 같이 보이도록 넉넉히 물러선다."""
         self._target = np.asarray(target, np.float64)
-        self._home_distance = max(radius * 4.5, 50.0)
+        self._home_distance = max(radius * 3.0, 50.0)
         self.reset_view()
 
     def reset_view(self) -> None:
@@ -84,6 +86,10 @@ class SceneView(QWidget):
         extrinsic = cam.look_at(eye, self._target)
         extrinsic[:3, 3] += np.array([self._pan[0], self._pan[1], 0.0])
         return viewer, extrinsic
+
+    def pose(self) -> np.ndarray:
+        """지금 보고 있는 자리의 world→camera."""
+        return self._viewer()[1]
 
     def refresh(self) -> None:
         if self._render_fn is None or not self.isVisible():
