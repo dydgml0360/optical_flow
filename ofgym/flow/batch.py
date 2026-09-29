@@ -28,7 +28,7 @@
     <출력>/
         batch.json      설정
         index.csv       쌍 목록 — split, 파일 경로, 촬영 위치, 통계
-        <record>/<번호>/img1.png img2.png flow.flo valid.png occluded.png meta.json
+        <record>/<번호>/img1.png img2.png flow.flo valid.png occluded.png face.png meta.json
 """
 
 from __future__ import annotations
@@ -331,6 +331,7 @@ class _Worker:
                 dict(record=record.record_id, source=str(record.path), split=split,
                      params=params.as_dict(), background_plane=note),
                 depth=self.settings.save_depth,
+                face=pair.ids == FACE_ID,
             )
             stats = gt.stats()
             rows.append(dict(
@@ -338,6 +339,7 @@ class _Worker:
                 img1=str(relative / "img1.png"), img2=str(relative / "img2.png"),
                 flow=str(relative / "flow.flo"), valid_mask=str(relative / "valid.png"),
                 occluded_mask=str(relative / "occluded.png"),
+                face_mask=str(relative / "face.png"),
                 view_angle=params.view_angle if params.free_view is None else "free",
                 valid=round(stats.get("valid", 0.0), 4),
                 occluded=round(stats.get("occluded", 0.0), 4),

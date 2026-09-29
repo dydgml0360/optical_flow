@@ -24,6 +24,9 @@ import numpy as np
 
 from ofgym.flow.renderer import Frame, PairFrame
 
+# 얼굴 메쉬의 물체 번호 (`scene.FACE_ID` 와 같다 — scene 이 이 모듈을 가져다 쓰므로 여기 둔다).
+FACE_ID = 1
+
 # 가려짐 판정 여유. 두 번째 프레임에서 다시 본 깊이가 그 자리 깊이보다 이만큼 넘게 멀면 가려진 것.
 OCCLUSION_TOLERANCE_MM = 0.05
 
@@ -240,18 +243,21 @@ def save_sample(directory: Path, first: Frame, second: Frame, gt: FlowGT,
     return save_pair(
         directory, first.color, second.color, gt, first.camera,
         first.extrinsic, second.extrinsic, first.models, second.models, meta, depth,
+        face=first.ids == FACE_ID,
     )
 
 
 def save_pair(directory: Path, color1: np.ndarray, color2: np.ndarray, gt: FlowGT,
               camera, extrinsic1, extrinsic2, models1: dict, models2: dict,
-              meta: dict, depth: bool = True) -> Path:
+              meta: dict, depth: bool = True,
+              face: Optional[np.ndarray] = None) -> Path:
     """한 쌍을 `directory` 에 쓴다.
 
         img1.png img2.png   사진
         flow.flo            img1 → img2, 픽셀
         valid.png           255 = 손실에 쓸 픽셀
         occluded.png        255 = img2 에서 안 보이는 픽셀
+        face.png            255 = 얼굴 (배경판이 아닌 곳). `face` 를 줬을 때만
         depth.npy           img1 의 카메라 Z (mm), float32  (`depth=False` 면 생략)
         meta.json           카메라·자세·기선
     """
@@ -262,6 +268,8 @@ def save_pair(directory: Path, color1: np.ndarray, color2: np.ndarray, gt: FlowG
     write_flo(directory / "flow.flo", gt.flow)
     cv2.imwrite(str(directory / "valid.png"), gt.valid.view(np.uint8) * 255)
     cv2.imwrite(str(directory / "occluded.png"), gt.occluded.view(np.uint8) * 255)
+    if face is not None:
+        cv2.imwrite(str(directory / "face.png"), face.view(np.uint8) * 255)
     if depth:
         np.save(directory / "depth.npy", np.ascontiguousarray(gt.depth))
 

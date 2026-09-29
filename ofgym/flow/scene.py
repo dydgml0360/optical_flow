@@ -24,11 +24,10 @@ import numpy as np
 
 from ofgym.flow import camera as cam
 from ofgym.flow.camera import Camera
-from ofgym.flow.gt import FlowGT, compute_flow
+from ofgym.flow.gt import FACE_ID, FlowGT, compute_flow
 from ofgym.flow.mesh import Mesh
 from ofgym.flow.renderer import BACKGROUND_COLOR, Frame, Renderer
 
-FACE_ID = 1
 BACKGROUND_ID = 2
 
 BACKGROUND_NONE = "없음"
