@@ -1,7 +1,8 @@
 """메인 윈도우. 위 탭으로 두 작업대를 오간다, 아래는 로그.
 
     Flow Gym   record(아틀라스 3D) → 합성 촬영 쌍 + optical flow GT
-    재구성     데이터셋 트리 | (2D 프리뷰 · 3D 뷰) | (3D 생성 · GT · 학습)
+    파인튜닝   그 데이터로 RAFT-Stereo / CREStereo 를 이어 학습 → 기존 모델과 비교
+    재구성     데이터셋 트리 | (2D 프리뷰 · 3D 뷰) | (3D 생성 · GT)
 """
 
 from __future__ import annotations
@@ -21,12 +22,12 @@ from ofgym.config import PATHS, depth_available
 from ofgym.data import Sample
 from ofgym.recon import find_output
 from ofgym.ui.dataset_panel import DatasetPanel
+from ofgym.ui.finetune_panel import FinetunePanel
 from ofgym.ui.flow_gym_panel import FlowGymPanel
 from ofgym.ui.gt_panel import GtPanel
 from ofgym.ui.model3d_panel import Model3DPanel
 from ofgym.ui.preview_panel import PreviewPanel
 from ofgym.ui.recon_panel import ReconPanel
-from ofgym.ui.train_panel import TrainPanel
 
 
 class MainWindow(QMainWindow):
@@ -42,7 +43,6 @@ class MainWindow(QMainWindow):
         self._model3d = Model3DPanel()
         self._recon = ReconPanel()
         self._gt = GtPanel()
-        self._train = TrainPanel()
 
         center = QTabWidget()
         center.addTab(self._preview, "2D 프리뷰")
@@ -52,7 +52,6 @@ class MainWindow(QMainWindow):
         right = QTabWidget()
         right.addTab(self._recon, "3D 생성")
         right.addTab(self._gt, "Disparity GT")
-        right.addTab(self._train, "파인튜닝")
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._dataset)
@@ -64,8 +63,15 @@ class MainWindow(QMainWindow):
         self._flow_gym = FlowGymPanel()
         pages = QTabWidget()
         pages.setDocumentMode(True)
+        self._finetune = FinetunePanel()
         pages.addTab(self._flow_gym, "Flow Gym")
+        pages.addTab(self._finetune, "파인튜닝")
         pages.addTab(splitter, "재구성")
+        # 일괄 생성으로 데이터가 늘었을 수 있으니 탭에 들어올 때마다 목록을 다시 읽는다.
+        pages.currentChanged.connect(
+            lambda index: self._finetune.reload() if pages.widget(index) is self._finetune
+            else None)
+        self._pages = pages
         self.setCentralWidget(pages)
 
         self._log = QPlainTextEdit()
@@ -84,13 +90,14 @@ class MainWindow(QMainWindow):
         self._recon.logMessage.connect(self.log)
         self._recon.reconFinished.connect(self._on_recon_finished)
         self._gt.logMessage.connect(self.log)
-        self._train.logMessage.connect(self.log)
         self._flow_gym.logMessage.connect(self.log)
+        self._finetune.logMessage.connect(self.log)
 
         self._dataset.reload()
         self._recon.set_all_samples(self._dataset.all_samples())
 
         self._flow_gym.reload()
+        self._finetune.reload()
 
         self.log(f"데이터셋 루트: {PATHS.dataset}")
         self.log(
@@ -100,6 +107,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._flow_gym.shutdown()
+        self._finetune.shutdown()
         super().closeEvent(event)
 
     def log(self, message: str) -> None:
