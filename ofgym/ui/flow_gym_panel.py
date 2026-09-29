@@ -2,7 +2,7 @@
 
     왼쪽    디렉터리 선택 + record 목록
     가운데  3D 씬 (카메라 두 대의 시야 포함) / 촬영 결과 6칸
-    오른쪽  카메라·얼굴 자세·배경 조절, 저장
+    오른쪽  카메라(촬영 위치·흔들림)·얼굴 움직임·무작위 범위·배경 조절, 저장
 
 촬영 결과 6칸:
 
@@ -22,6 +22,7 @@ import numpy as np
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QImage, QPixmap
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -53,6 +54,8 @@ from ofgym.flow.scene import (
     BACKGROUND_IMAGE,
     BACKGROUND_NOISE,
     BACKGROUND_NONE,
+    VIEW_ANGLES,
+    RandomRanges,
     Scene,
     SceneParams,
     Shot,
@@ -228,6 +231,10 @@ class FlowGymPanel(QWidget):
         self._baseline = _spin(0.0, 200.0, defaults.baseline_mm, 1.0, " mm")
         self._axis = QComboBox()
         self._axis.addItems([AXIS_VERTICAL, AXIS_HORIZONTAL])
+        self._view = QComboBox()
+        for label, angle in VIEW_ANGLES.items():
+            self._view.addItem(label, angle)
+        self._view.setCurrentIndex(list(VIEW_ANGLES.values()).index(0.0))
         self._camera_info = QLabel("-")
         self._camera_info.setStyleSheet("color: palette(mid);")
 
@@ -235,38 +242,49 @@ class FlowGymPanel(QWidget):
         camera_form.addRow("해상도", self._scale)
         camera_form.addRow("기선 길이", self._baseline)
         camera_form.addRow("기선 방향", self._axis)
+        camera_form.addRow("촬영 위치", self._view)
         camera_form.addRow(self._camera_info)
         camera_box = QGroupBox("카메라")
         camera_box.setLayout(camera_form)
 
-        # 얼굴 자세
-        self._offset_x = _spin(-500, 500, 0, 5, " mm")
-        self._offset_y = _spin(-500, 500, 0, 5, " mm")
-        self._offset_z = _spin(-120, 3000, 0, 10, " mm")
-        self._yaw = _spin(-90, 90, 0, 5, " °")
-        self._pitch = _spin(-90, 90, 0, 5, " °")
-        self._roll = _spin(-180, 180, 0, 5, " °")
+        # 카메라 흔들림 · 얼굴 움직임 — 같은 모양의 tvec / rvec 여섯 칸
+        self._camera_pose = self._pose_spins(100.0, 45.0)
+        self._face_pose = self._pose_spins(500.0, 180.0)
+        jitter_box = QGroupBox("카메라 흔들림 (촬영 위치의 카메라 좌표계)")
+        jitter_box.setLayout(self._pose_form(self._camera_pose))
+        pose_box = QGroupBox("얼굴 움직임 (캡처 자세 기준, 월드 좌표계)")
+        pose_box.setLayout(self._pose_form(self._face_pose))
+
+        # 무작위 범위
+        ranges = RandomRanges()
+        self._range_camera_t = _spin(0, 100, ranges.camera_t, 1, " mm")
+        self._range_camera_r = _spin(0, 45, ranges.camera_r, 0.5, " °")
+        self._range_face_t = _spin(0, 200, ranges.face_t, 1, " mm")
+        self._range_face_r = _spin(0, 90, ranges.face_r, 0.5, " °")
+        self._random_view = QCheckBox("촬영 위치도 뽑기 (+50° / 0° / -50°)")
+        self._random_view.setChecked(ranges.random_view)
 
         random_button = QPushButton("무작위 배치")
-        random_button.setToolTip("얼굴 자세와 배경 무늬를 새로 뽑는다 (FlyingThings 방식)")
+        random_button.setToolTip(
+            "카메라 흔들림·얼굴 움직임을 성분마다 ±범위 안에서 새로 뽑는다 (배경 무늬도)"
+        )
         random_button.clicked.connect(self._randomize)
         reset_button = QPushButton("캡처 자세로")
-        reset_button.setToolTip("디바이스가 실제로 찍던 배치로 되돌린다")
+        reset_button.setToolTip("흔들림과 움직임을 0 으로 — 디바이스가 실제로 찍던 배치")
         reset_button.clicked.connect(self._reset_pose)
         pose_buttons = QHBoxLayout()
         pose_buttons.addWidget(random_button)
         pose_buttons.addWidget(reset_button)
 
-        pose_form = QFormLayout()
-        pose_form.addRow("좌우 이동 X", self._offset_x)
-        pose_form.addRow("상하 이동 Y", self._offset_y)
-        pose_form.addRow("앞뒤 이동 Z", self._offset_z)
-        pose_form.addRow("yaw (좌우 돌림)", self._yaw)
-        pose_form.addRow("pitch (끄덕임)", self._pitch)
-        pose_form.addRow("roll (갸웃)", self._roll)
-        pose_form.addRow(pose_buttons)
-        pose_box = QGroupBox("얼굴 배치 (캡처 자세 기준)")
-        pose_box.setLayout(pose_form)
+        random_form = QFormLayout()
+        random_form.addRow("카메라 tvec ±", self._range_camera_t)
+        random_form.addRow("카메라 rvec ±", self._range_camera_r)
+        random_form.addRow("얼굴 tvec ±", self._range_face_t)
+        random_form.addRow("얼굴 rvec ±", self._range_face_r)
+        random_form.addRow(self._random_view)
+        random_form.addRow(pose_buttons)
+        random_box = QGroupBox("무작위 범위")
+        random_box.setLayout(random_form)
 
         # 배경
         self._background = QComboBox()
@@ -299,16 +317,17 @@ class FlowGymPanel(QWidget):
         save_box = QGroupBox("저장")
         save_box.setLayout(save_form)
 
-        for box in (self._baseline, self._offset_x, self._offset_y, self._offset_z,
-                    self._yaw, self._pitch, self._roll, self._background_z):
+        for box in (self._baseline, self._background_z,
+                    *self._camera_pose.values(), *self._face_pose.values()):
             box.valueChanged.connect(self._on_params_changed)
-        for combo in (self._scale, self._axis, self._background):
+        for combo in (self._scale, self._axis, self._view, self._background):
             combo.currentIndexChanged.connect(self._on_params_changed)
 
         inner = QWidget()
         layout = QVBoxLayout(inner)
         layout.setContentsMargins(8, 8, 8, 8)
-        for box in (camera_box, pose_box, background_box, save_box):
+        for box in (camera_box, jitter_box, pose_box, random_box, background_box,
+                    save_box):
             layout.addWidget(box)
         layout.addStretch(1)
 
@@ -318,6 +337,25 @@ class FlowGymPanel(QWidget):
         scroll.setWidget(inner)
         self._sync_background_widgets()
         return scroll
+
+    @staticmethod
+    def _pose_spins(limit_t: float, limit_r: float) -> Dict[str, QDoubleSpinBox]:
+        spins = {}
+        for axis in "xyz":
+            spins[f"t{axis}"] = _spin(-limit_t, limit_t, 0, 1, " mm")
+        for axis in "xyz":
+            spins[f"r{axis}"] = _spin(-limit_r, limit_r, 0, 1, " °")
+        return spins
+
+    @staticmethod
+    def _pose_form(spins: Dict[str, QDoubleSpinBox]) -> QFormLayout:
+        # 작은 각에서 rvec 의 성분은 그 축 둘레의 회전이다.
+        hints = dict(tx="오른쪽", ty="아래", tz="앞", rx="끄덕임", ry="좌우 돌림", rz="갸웃")
+        form = QFormLayout()
+        for key, box in spins.items():
+            kind = "tvec" if key[0] == "t" else "rvec"
+            form.addRow(f"{kind} {key[1].upper()}  ({hints[key]})", box)
+        return form
 
     # ── record 목록 ───────────────────────────────────────────────────────
     def reload(self, root: Optional[Path] = None) -> None:
@@ -406,41 +444,51 @@ class FlowGymPanel(QWidget):
 
     # ── 조절값 ────────────────────────────────────────────────────────────
     def params(self) -> SceneParams:
+        pose = {f"camera_{key}": box.value() for key, box in self._camera_pose.items()}
+        pose.update({f"face_{key}": box.value() for key, box in self._face_pose.items()})
         return SceneParams(
             scale=float(self._scale.currentData()),
             baseline_mm=self._baseline.value(),
             baseline_axis=self._axis.currentText(),
-            offset_x=self._offset_x.value(),
-            offset_y=self._offset_y.value(),
-            offset_z=self._offset_z.value(),
-            yaw=self._yaw.value(),
-            pitch=self._pitch.value(),
-            roll=self._roll.value(),
+            view_angle=float(self._view.currentData()),
             background=self._background.currentText(),
             background_z=self._background_z.value(),
             background_seed=self._background_seed,
             background_image=self._background_image,
+            **pose,
+        )
+
+    def ranges(self) -> RandomRanges:
+        return RandomRanges(
+            camera_t=self._range_camera_t.value(),
+            camera_r=self._range_camera_r.value(),
+            face_t=self._range_face_t.value(),
+            face_r=self._range_face_r.value(),
+            random_view=self._random_view.isChecked(),
         )
 
     def _set_pose(self, params: SceneParams) -> None:
+        values = params.as_dict()
         self._loading = True
         try:
-            self._offset_x.setValue(params.offset_x)
-            self._offset_y.setValue(params.offset_y)
-            self._offset_z.setValue(params.offset_z)
-            self._yaw.setValue(params.yaw)
-            self._pitch.setValue(params.pitch)
-            self._roll.setValue(params.roll)
+            for key, box in self._camera_pose.items():
+                box.setValue(values[f"camera_{key}"])
+            for key, box in self._face_pose.items():
+                box.setValue(values[f"face_{key}"])
+            index = self._view.findData(params.view_angle)
+            if index >= 0:
+                self._view.setCurrentIndex(index)
             self._background_seed = params.background_seed
         finally:
             self._loading = False
         self._on_params_changed()
 
     def _randomize(self) -> None:
-        self._set_pose(randomized(self.params(), self._rng))
+        self._set_pose(randomized(self.params(), self.ranges(), self._rng))
 
     def _reset_pose(self) -> None:
-        self._set_pose(SceneParams(background_seed=self._background_seed))
+        self._set_pose(SceneParams(view_angle=float(self._view.currentData()),
+                                   background_seed=self._background_seed))
 
     def _sync_background_widgets(self) -> None:
         uses_image = self._background.currentText() == BACKGROUND_IMAGE
