@@ -5,6 +5,7 @@ CREStereo / RAFT-Stereo 계열 모델을 자체 캡처 데이터로 파인튜닝
 ## 구성
 
 - `ofgym/` — PySide6 데스크톱 UI + 데이터셋/GT 파이프라인
+- `ofgym/flow/` — Flow Gym: 아틀라스 3D 를 합성 촬영해 optical flow GT 를 만든다
 - `thirdparty/depth` — DepthEstimation 서브모듈. 캘리브레이션·스테레오·3D 재구성 코드를 여기서 가져다 쓴다.
 - `../dataset/` — 데이터 저장소(저장소 밖). `raw/<세션>/<샘플UUID>/` 구조.
 
@@ -13,6 +14,59 @@ CREStereo / RAFT-Stereo 계열 모델을 자체 캡처 데이터로 파인튜닝
 ```
 uv run main
 ```
+
+저장소 폴더 안에서는 이것으로 된다. **다른 폴더(홈 등)에서도** 띄우려면 한 번 설치해 둔다:
+
+```
+uv tool install --editable .    # 저장소 폴더에서. ~/.local/bin/main 이 생긴다
+```
+
+그 뒤로는 어디서든 `uv run main` (또는 그냥 `main`) 이다. editable 이라 코드를 고치면
+바로 반영되고, 경로(`thirdparty/depth`, `../dataset`, `../shared`)는 실행한 폴더가 아니라
+저장소 위치를 기준으로 잡힌다. 의존성을 바꿨을 때만 `uv tool install --editable . --reinstall`
+로 다시 맞춘다. 지울 때는 `uv tool uninstall optical-flow-gym`.
+
+## Flow Gym
+
+FlyingChairs / FlyingThings 처럼 **그래픽스로 찍어서** flow GT 를 얻는다. 실제 촬영으로는
+픽셀 단위 정답을 얻을 수 없지만, 3D 를 렌더하면 정답이 계산으로 나온다.
+
+1. `디렉터리 선택…` 으로 record 가 있는 폴더를 고른다 (기본 `../shared`, `OFGYM_SHARED`
+   로 바꿀 수 있다). `atlas_meta.json` 이 있는 폴더를 전부 찾아 목록에 올린다.
+2. record 를 고르면 세 뷰의 정점맵(`{left,center,right}.npy`)을 원통 (θ, l) 격자에 모아
+   한 겹짜리 메쉬를 만들고 `atlas.png` 를 텍스처로 입힌다.
+3. 첫 카메라로 한 장, **기선만큼 평행 이동**한 자리에서 한 장 더 찍는다. 씬은 멈춰
+   있으므로 flow 는 시차와 같다: `f · B / Z`, 기선 방향으로만.
+4. `촬영 결과` 탭에서 확인한다. `되돌린 사진 2` 가 `사진 1` 과 겹치고 `색 오차` 가
+   어두우면 GT 가 맞는 것이다.
+
+카메라는 디바이스 값(`config/intrinsic.yaml`, `stereo.yaml` 의 baseline 15mm)을 쓴다.
+모든 조절값이 0 이면 디바이스가 실제로 찍던 배치다 — 렌더가 `center.jpg` /
+`center_pair.jpg` 와 같은 자리에 나온다. 디바이스는 센서를 90° 돌려 달아 짝 카메라가
+**세로로** 떨어져 있으므로 기본 기선 방향도 세로다. 가로 시차만 받는 모델에 넣을 때는
+`기선 방향` 을 `가로` 로 바꾼다.
+
+`이 쌍 저장` 은 `../dataset/flow/<record>/<번호>/` 에 쓴다:
+
+```
+img1.png img2.png   사진
+flow.flo            img1 → img2 (Middlebury .flo, RAFT 가 읽는 형식)
+valid.png           255 = 손실에 쓸 픽셀
+occluded.png        255 = img2 에서 가려졌거나 화면 밖
+depth.npy           img1 의 카메라 Z (mm)
+meta.json           카메라·자세·기선·통계
+```
+
+알아 둘 것:
+
+- flow 는 가려진 픽셀에도 값이 있다 (FlyingThings 와 같다). 손실에는 `valid.png` 를 쓴다.
+- 가려짐 경계 1픽셀 폭은 `유효` 로 남는다 (판정을 3x3 이웃 깊이로 하기 때문).
+- 사진은 4x MSAA 라 실루엣 픽셀은 앞뒤 색이 섞이지만 GT 는 픽셀 중심의 표면 하나를
+  가리킨다. `색 오차` 에서 윤곽선이 밝게 보이는 이유다.
+- 조명은 넣지 않는다. 아틀라스에 촬영 당시 조명이 구워져 있어 두 장의 밝기가 같다 —
+  실제 스테레오 쌍에 있는 노출·반사 차이는 아직 없다.
+- 아틀라스가 덮지 못한 곳(목·귀·머리카락)은 메쉬에 없다.
+- 렌더러는 OpenGL 3.3 이 필요하다 (moderngl standalone 컨텍스트).
 
 ## 데이터 흐름
 
