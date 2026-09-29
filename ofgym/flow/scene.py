@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -53,6 +53,8 @@ class SceneParams:
     baseline_mm: float = 15.0
     baseline_axis: str = AXIS_VERTICAL
     view_angle: float = 0.0  # 촬영 위치, 도
+    # 자유 시점 — world→camera 4x4. 있으면 촬영 위치 대신 이 자리에 선다.
+    free_view: Optional[List[List[float]]] = None
     # 카메라 흔들림 — 촬영 위치의 카메라 좌표계 기준
     camera_tx: float = 0.0
     camera_ty: float = 0.0
@@ -119,6 +121,7 @@ def randomized(params: SceneParams, ranges: RandomRanges,
             values[f"{prefix}_r{axis}"] = float(rng.uniform(-limit_r, limit_r))
     if ranges.random_view:
         values["view_angle"] = float(rng.choice(list(VIEW_ANGLES.values())))
+        values["free_view"] = None
     values["background_seed"] = int(rng.integers(0, 2**31 - 1))
     return SceneParams(**values)
 
@@ -191,9 +194,14 @@ class Scene:
         """촬영 위치에 흔들림 없이 선 카메라의 world→camera."""
         return cam.orbit(angle, self.pivot_radius)
 
+    def base_pose(self, params: SceneParams) -> np.ndarray:
+        """흔들기 전 카메라 자리 — 자유 시점이 있으면 그것, 없으면 촬영 위치."""
+        if params.free_view is not None:
+            return np.array(params.free_view, np.float64)
+        return self.station(params.view_angle)
+
     def extrinsics(self, params: SceneParams) -> Tuple[np.ndarray, np.ndarray]:
-        first = cam.rigid(params.camera_rvec, params.camera_tvec) @ self.station(
-            params.view_angle)
+        first = cam.rigid(params.camera_rvec, params.camera_tvec) @ self.base_pose(params)
         return first, cam.shifted(first, params.baseline_vector())
 
     def face_model(self, params: SceneParams) -> np.ndarray:
@@ -207,8 +215,8 @@ class Scene:
         if self._mesh is not None:
             models[FACE_ID] = self.face_model(params)
         if self._renderer.has_object(BACKGROUND_ID):
-            # 배경판은 촬영 위치의 카메라를 마주 본다 (카메라가 흔들려도 판은 그대로다).
-            models[BACKGROUND_ID] = np.linalg.inv(self.station(params.view_angle))
+            # 배경판은 흔들기 전 카메라를 마주 본다 (카메라가 흔들려도 판은 그대로다).
+            models[BACKGROUND_ID] = np.linalg.inv(self.base_pose(params))
         return models
 
     def _sync_background(self, params: SceneParams) -> None:
@@ -278,10 +286,11 @@ class Scene:
             (cam.frustum_lines(camera, self.station(angle), depth * 0.6), (0.42, 0.42, 0.45))
             for angle in VIEW_ANGLES.values()
         ]
-        lines += [
-            (cam.frustum_lines(camera, extrinsic1, depth), (1.0, 0.82, 0.25)),
-            (cam.frustum_lines(camera, extrinsic2, depth), (0.35, 0.8, 1.0)),
-        ]
+        # 보는 자리가 곧 카메라 자리면 (자유 시점으로 찍은 직후) 시야 선이 눈앞을 가로지른다.
+        eye = cam.camera_center(extrinsic)
+        for pose, color in ((extrinsic1, (1.0, 0.82, 0.25)), (extrinsic2, (0.35, 0.8, 1.0))):
+            if np.linalg.norm(cam.camera_center(pose) - eye) > depth:
+                lines.append((cam.frustum_lines(camera, pose, depth), color))
         frame = self._renderer.render(
             viewer, extrinsic, self.models(params),
             background=BACKGROUND_COLOR, lines=lines, geometry=False,
