@@ -1,4 +1,8 @@
-"""메인 윈도우: 데이터셋 트리 | (2D 프리뷰 · 3D 뷰) | (3D 생성 · GT · 학습), 아래 로그."""
+"""메인 윈도우. 위 탭으로 두 작업대를 오간다, 아래는 로그.
+
+    Flow Gym   record(아틀라스 3D) → 합성 촬영 쌍 + optical flow GT
+    재구성     데이터셋 트리 | (2D 프리뷰 · 3D 뷰) | (3D 생성 · GT · 학습)
+"""
 
 from __future__ import annotations
 
@@ -17,6 +21,7 @@ from ofgym.config import PATHS, depth_available
 from ofgym.data import Sample
 from ofgym.recon import find_output
 from ofgym.ui.dataset_panel import DatasetPanel
+from ofgym.ui.flow_gym_panel import FlowGymPanel
 from ofgym.ui.gt_panel import GtPanel
 from ofgym.ui.model3d_panel import Model3DPanel
 from ofgym.ui.preview_panel import PreviewPanel
@@ -55,7 +60,13 @@ class MainWindow(QMainWindow):
         splitter.addWidget(right)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([300, 860, 400])
-        self.setCentralWidget(splitter)
+
+        self._flow_gym = FlowGymPanel()
+        pages = QTabWidget()
+        pages.setDocumentMode(True)
+        pages.addTab(self._flow_gym, "Flow Gym")
+        pages.addTab(splitter, "재구성")
+        self.setCentralWidget(pages)
 
         self._log = QPlainTextEdit()
         self._log.setReadOnly(True)
@@ -74,9 +85,12 @@ class MainWindow(QMainWindow):
         self._recon.reconFinished.connect(self._on_recon_finished)
         self._gt.logMessage.connect(self.log)
         self._train.logMessage.connect(self.log)
+        self._flow_gym.logMessage.connect(self.log)
 
         self._dataset.reload()
         self._recon.set_all_samples(self._dataset.all_samples())
+
+        self._flow_gym.reload()
 
         self.log(f"데이터셋 루트: {PATHS.dataset}")
         self.log(

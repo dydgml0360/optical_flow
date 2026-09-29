@@ -1,0 +1,548 @@
+"""Flow Gym — record 를 3D 로 올리고, 스테레오처럼 두 장 찍어 flow GT 를 눈으로 확인한다.
+
+    왼쪽    디렉터리 선택 + record 목록
+    가운데  3D 씬 (카메라 두 대의 시야 포함) / 촬영 결과 6칸
+    오른쪽  카메라·얼굴 자세·배경 조절, 저장
+
+촬영 결과 6칸:
+
+    사진 1      사진 2          flow (방향=색, 크기=채도)
+    마스크      되돌린 사진 2   색 오차
+
+'되돌린 사진 2' 는 사진 2 를 GT flow 로 끌어와 사진 1 자리에 맞춘 것이다. GT 가 맞으면
+사진 1 과 겹치고 색 오차가 0 에 가깝다 — 가려진 곳(빨강)만 예외다.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Dict, Optional
+
+import numpy as np
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QGuiApplication, QImage, QPixmap
+from PySide6.QtWidgets import (
+    QComboBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSplitter,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+from ofgym.config import PATHS
+from ofgym.flow import gt as flow_gt
+from ofgym.flow.camera import device_baseline
+from ofgym.flow.mesh import build_mesh
+from ofgym.flow.record import Record, find_records
+from ofgym.flow.renderer import Renderer
+from ofgym.flow.scene import (
+    AXIS_HORIZONTAL,
+    AXIS_VERTICAL,
+    BACKGROUND_IMAGE,
+    BACKGROUND_NOISE,
+    BACKGROUND_NONE,
+    Scene,
+    SceneParams,
+    Shot,
+    randomized,
+)
+from ofgym.ui.scene_view import SceneView
+
+RECORD_ROLE = Qt.ItemDataRole.UserRole
+
+PANES = ("사진 1", "사진 2", "flow", "마스크", "되돌린 사진 2", "색 오차")
+ERROR_RANGE = 20.0  # 색 오차 그림에서 가장 밝은 색이 되는 계조 차
+
+
+class ImagePane(QWidget):
+    """제목 + 창 크기에 맞춰 줄여 그리는 그림 한 칸."""
+
+    def __init__(self, title: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._pixmap: Optional[QPixmap] = None
+
+        self._title = QLabel(title)
+        self._title.setStyleSheet("color: palette(mid);")
+        self._canvas = QLabel()
+        self._canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._canvas.setMinimumSize(80, 80)
+        self._canvas.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self._canvas.setStyleSheet("background: #1b1b1b; border-radius: 4px;")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addWidget(self._title)
+        layout.addWidget(self._canvas, 1)
+
+    def set_caption(self, text: str) -> None:
+        self._title.setText(text)
+
+    def set_image(self, rgb: Optional[np.ndarray]) -> None:
+        if rgb is None:
+            self._pixmap = None
+            self._canvas.clear()
+            return
+        rgb = np.ascontiguousarray(rgb)
+        height, width, _ = rgb.shape
+        image = QImage(rgb.data, width, height, 3 * width, QImage.Format.Format_RGB888)
+        self._pixmap = QPixmap.fromImage(image.copy())
+        self._fit()
+
+    def _fit(self) -> None:
+        if self._pixmap is None:
+            return
+        self._canvas.setPixmap(
+            self._pixmap.scaled(
+                self._canvas.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._fit()
+
+
+def _spin(low: float, high: float, value: float, step: float, suffix: str,
+          decimals: int = 1) -> QDoubleSpinBox:
+    box = QDoubleSpinBox()
+    box.setRange(low, high)
+    box.setDecimals(decimals)
+    box.setSingleStep(step)
+    box.setValue(value)
+    box.setSuffix(suffix)
+    box.setKeyboardTracking(False)  # 숫자를 치는 도중에는 다시 찍지 않는다
+    return box
+
+
+class FlowGymPanel(QWidget):
+    logMessage = Signal(str)
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+
+        self._renderer: Optional[Renderer] = None
+        self._scene: Optional[Scene] = None
+        self._record: Optional[Record] = None
+        self._shot: Optional[Shot] = None
+        self._root: Path = PATHS.shared
+        self._background_image: Optional[str] = None
+        self._background_seed = 0
+        self._rng = np.random.default_rng()
+        self._loading = False
+
+        self._pending = QTimer(self)
+        self._pending.setSingleShot(True)
+        self._pending.setInterval(30)
+        self._pending.timeout.connect(self._shoot)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(self._build_browser())
+        splitter.addWidget(self._build_views())
+        splitter.addWidget(self._build_controls())
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([280, 900, 340])
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(splitter)
+
+    # ── 화면 구성 ─────────────────────────────────────────────────────────
+    def _build_browser(self) -> QWidget:
+        self._root_label = QLabel()
+        self._root_label.setWordWrap(True)
+        self._root_label.setStyleSheet("color: palette(mid);")
+
+        choose = QPushButton("디렉터리 선택…")
+        choose.clicked.connect(self._choose_root)
+
+        self._list = QListWidget()
+        self._list.setUniformItemSizes(True)
+        self._list.currentItemChanged.connect(self._on_record_changed)
+
+        self._record_info = QLabel("-")
+        self._record_info.setWordWrap(True)
+        self._record_info.setStyleSheet("color: palette(mid);")
+
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.addWidget(choose)
+        layout.addWidget(self._root_label)
+        layout.addWidget(self._list, 1)
+        layout.addWidget(self._record_info)
+        return box
+
+    def _build_views(self) -> QWidget:
+        self._scene_view = SceneView()
+
+        self._panes: Dict[str, ImagePane] = {}
+        grid = QGridLayout()
+        grid.setContentsMargins(6, 6, 6, 6)
+        grid.setSpacing(6)
+        for index, title in enumerate(PANES):
+            pane = ImagePane(title)
+            self._panes[title] = pane
+            grid.addWidget(pane, index // 3, index % 3)
+        shots = QWidget()
+        shots.setLayout(grid)
+
+        self._stats = QLabel("-")
+        self._stats.setWordWrap(True)
+        self._stats.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        self._tabs = QTabWidget()
+        self._tabs.addTab(self._scene_view, "3D 씬")
+        self._tabs.addTab(shots, "촬영 결과")
+
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.addWidget(self._tabs, 1)
+        layout.addWidget(self._stats)
+        return box
+
+    def _build_controls(self) -> QWidget:
+        defaults = SceneParams(baseline_mm=device_baseline())
+
+        # 카메라
+        self._scale = QComboBox()
+        for label, value in (("1/8", 0.125), ("1/6", 1 / 6), ("1/4", 0.25),
+                             ("1/2", 0.5), ("1/1 (3040x4032)", 1.0)):
+            self._scale.addItem(label, value)
+        self._scale.setCurrentIndex(2)
+        self._baseline = _spin(0.0, 200.0, defaults.baseline_mm, 1.0, " mm")
+        self._axis = QComboBox()
+        self._axis.addItems([AXIS_VERTICAL, AXIS_HORIZONTAL])
+        self._camera_info = QLabel("-")
+        self._camera_info.setStyleSheet("color: palette(mid);")
+
+        camera_form = QFormLayout()
+        camera_form.addRow("해상도", self._scale)
+        camera_form.addRow("기선 길이", self._baseline)
+        camera_form.addRow("기선 방향", self._axis)
+        camera_form.addRow(self._camera_info)
+        camera_box = QGroupBox("카메라")
+        camera_box.setLayout(camera_form)
+
+        # 얼굴 자세
+        self._offset_x = _spin(-500, 500, 0, 5, " mm")
+        self._offset_y = _spin(-500, 500, 0, 5, " mm")
+        self._offset_z = _spin(-120, 3000, 0, 10, " mm")
+        self._yaw = _spin(-90, 90, 0, 5, " °")
+        self._pitch = _spin(-90, 90, 0, 5, " °")
+        self._roll = _spin(-180, 180, 0, 5, " °")
+
+        random_button = QPushButton("무작위 배치")
+        random_button.setToolTip("얼굴 자세와 배경 무늬를 새로 뽑는다 (FlyingThings 방식)")
+        random_button.clicked.connect(self._randomize)
+        reset_button = QPushButton("캡처 자세로")
+        reset_button.setToolTip("디바이스가 실제로 찍던 배치로 되돌린다")
+        reset_button.clicked.connect(self._reset_pose)
+        pose_buttons = QHBoxLayout()
+        pose_buttons.addWidget(random_button)
+        pose_buttons.addWidget(reset_button)
+
+        pose_form = QFormLayout()
+        pose_form.addRow("좌우 이동 X", self._offset_x)
+        pose_form.addRow("상하 이동 Y", self._offset_y)
+        pose_form.addRow("앞뒤 이동 Z", self._offset_z)
+        pose_form.addRow("yaw (좌우 돌림)", self._yaw)
+        pose_form.addRow("pitch (끄덕임)", self._pitch)
+        pose_form.addRow("roll (갸웃)", self._roll)
+        pose_form.addRow(pose_buttons)
+        pose_box = QGroupBox("얼굴 배치 (캡처 자세 기준)")
+        pose_box.setLayout(pose_form)
+
+        # 배경
+        self._background = QComboBox()
+        self._background.addItems([BACKGROUND_NOISE, BACKGROUND_IMAGE, BACKGROUND_NONE])
+        self._background_z = _spin(100, 10000, defaults.background_z, 50, " mm", 0)
+        self._image_button = QPushButton("이미지 고르기…")
+        self._image_button.clicked.connect(self._choose_background)
+        self._image_label = QLabel("선택 안 됨")
+        self._image_label.setStyleSheet("color: palette(mid);")
+        self._image_label.setWordWrap(True)
+
+        background_form = QFormLayout()
+        background_form.addRow("종류", self._background)
+        background_form.addRow("거리 Z", self._background_z)
+        background_form.addRow(self._image_button)
+        background_form.addRow(self._image_label)
+        background_box = QGroupBox("배경판")
+        background_box.setLayout(background_form)
+
+        # 저장
+        self._save = QPushButton("이 쌍 저장")
+        self._save.clicked.connect(self._save_shot)
+        self._save.setEnabled(False)
+        out = QLabel(str(PATHS.flow))
+        out.setWordWrap(True)
+        out.setStyleSheet("color: palette(mid);")
+        save_form = QFormLayout()
+        save_form.addRow(self._save)
+        save_form.addRow("출력", out)
+        save_box = QGroupBox("저장")
+        save_box.setLayout(save_form)
+
+        for box in (self._baseline, self._offset_x, self._offset_y, self._offset_z,
+                    self._yaw, self._pitch, self._roll, self._background_z):
+            box.valueChanged.connect(self._on_params_changed)
+        for combo in (self._scale, self._axis, self._background):
+            combo.currentIndexChanged.connect(self._on_params_changed)
+
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+        layout.setContentsMargins(8, 8, 8, 8)
+        for box in (camera_box, pose_box, background_box, save_box):
+            layout.addWidget(box)
+        layout.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setWidget(inner)
+        self._sync_background_widgets()
+        return scroll
+
+    # ── record 목록 ───────────────────────────────────────────────────────
+    def reload(self, root: Optional[Path] = None) -> None:
+        if root is not None:
+            self._root = Path(root)
+        self._root_label.setText(str(self._root))
+        self._list.clear()
+
+        records = find_records(self._root)
+        if not records:
+            item = QListWidgetItem("아틀라스가 있는 record 가 없습니다")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self._list.addItem(item)
+            self.logMessage.emit(f"[FlowGym] record 없음: {self._root}")
+            return
+
+        for record in records:
+            item = QListWidgetItem(record.label)
+            item.setData(RECORD_ROLE, record)
+            item.setToolTip(str(record.path))
+            self._list.addItem(item)
+        self.logMessage.emit(f"[FlowGym] record {len(records)}개  ({self._root})")
+        self._list.setCurrentRow(0)
+
+    def _choose_root(self) -> None:
+        start = self._root if self._root.is_dir() else Path.home()
+        chosen = QFileDialog.getExistingDirectory(
+            self, "record 가 있는 디렉터리 (record 하나를 바로 골라도 됩니다)", str(start)
+        )
+        if chosen:
+            self.reload(Path(chosen))
+
+    def _on_record_changed(self, current: Optional[QListWidgetItem], _previous) -> None:
+        record = current.data(RECORD_ROLE) if current is not None else None
+        if record is not None:
+            self._load_record(record)
+
+    def _ensure_scene(self) -> Optional[Scene]:
+        if self._scene is not None:
+            return self._scene
+        try:
+            self._renderer = Renderer()
+        except Exception as exc:
+            self._scene_view.set_message(f"렌더러를 만들지 못했습니다\n{exc}")
+            self.logMessage.emit(f"[FlowGym] 렌더러 실패: {exc}")
+            return None
+        self._scene = Scene(self._renderer)
+        self.logMessage.emit(f"[FlowGym] 렌더러: {self._renderer.description}")
+        return self._scene
+
+    def _load_record(self, record: Record) -> None:
+        scene = self._ensure_scene()
+        if scene is None:
+            return
+        QGuiApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            mesh = build_mesh(record)
+            scene.set_mesh(mesh)
+        except Exception as exc:
+            scene.set_mesh(None)
+            self._record = None
+            self._shot = None
+            self._save.setEnabled(False)
+            self._scene_view.set_render(None)
+            self._scene_view.set_message(f"불러오기 실패\n{exc}")
+            self._record_info.setText(str(exc))
+            self.logMessage.emit(f"[FlowGym] {record.record_id}: {exc}")
+            return
+        finally:
+            QGuiApplication.restoreOverrideCursor()
+
+        self._record = record
+        meta = record.meta
+        self._record_info.setText(
+            f"{record.group} / {record.record_id}\n"
+            f"아틀라스 {meta['width']}x{meta['height']}  텍셀 {meta['z_rate'] * 1000:.0f}µm\n"
+            f"메쉬 정점 {len(mesh.vertices):,} · 면 {len(mesh.faces):,} · "
+            f"격자 {mesh.step_mm:.2f}mm"
+        )
+        self.logMessage.emit(
+            f"[FlowGym] {record.record_id} 메쉬 {len(mesh.faces):,}면  ({record.path})"
+        )
+        self._scene_view.set_render(self._render_overview)
+        self._scene_view.frame(mesh.center, mesh.radius)
+        self._shoot()
+
+    # ── 조절값 ────────────────────────────────────────────────────────────
+    def params(self) -> SceneParams:
+        return SceneParams(
+            scale=float(self._scale.currentData()),
+            baseline_mm=self._baseline.value(),
+            baseline_axis=self._axis.currentText(),
+            offset_x=self._offset_x.value(),
+            offset_y=self._offset_y.value(),
+            offset_z=self._offset_z.value(),
+            yaw=self._yaw.value(),
+            pitch=self._pitch.value(),
+            roll=self._roll.value(),
+            background=self._background.currentText(),
+            background_z=self._background_z.value(),
+            background_seed=self._background_seed,
+            background_image=self._background_image,
+        )
+
+    def _set_pose(self, params: SceneParams) -> None:
+        self._loading = True
+        try:
+            self._offset_x.setValue(params.offset_x)
+            self._offset_y.setValue(params.offset_y)
+            self._offset_z.setValue(params.offset_z)
+            self._yaw.setValue(params.yaw)
+            self._pitch.setValue(params.pitch)
+            self._roll.setValue(params.roll)
+            self._background_seed = params.background_seed
+        finally:
+            self._loading = False
+        self._on_params_changed()
+
+    def _randomize(self) -> None:
+        self._set_pose(randomized(self.params(), self._rng))
+
+    def _reset_pose(self) -> None:
+        self._set_pose(SceneParams(background_seed=self._background_seed))
+
+    def _sync_background_widgets(self) -> None:
+        uses_image = self._background.currentText() == BACKGROUND_IMAGE
+        self._image_button.setVisible(uses_image)
+        self._image_label.setVisible(uses_image)
+        self._background_z.setEnabled(self._background.currentText() != BACKGROUND_NONE)
+
+    def _choose_background(self) -> None:
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, "배경 이미지", str(Path.home()), "이미지 (*.png *.jpg *.jpeg *.bmp *.webp)"
+        )
+        if chosen:
+            self._background_image = chosen
+            self._image_label.setText(Path(chosen).name)
+            self._on_params_changed()
+
+    def _on_params_changed(self, *_args) -> None:
+        self._sync_background_widgets()
+        if not self._loading:
+            self._pending.start()
+
+    # ── 촬영 ──────────────────────────────────────────────────────────────
+    def _render_overview(self, viewer, extrinsic):
+        if self._scene is None or self._scene.mesh is None:
+            return None
+        return self._scene.overview(self.params(), viewer, extrinsic)
+
+    def _shoot(self) -> None:
+        if self._scene is None or self._scene.mesh is None:
+            return
+        params = self.params()
+        try:
+            shot = self._scene.shoot(params)
+        except Exception as exc:
+            self._shot = None
+            self._save.setEnabled(False)
+            self._stats.setText(f"촬영 실패: {exc}")
+            self.logMessage.emit(f"[FlowGym] 촬영 실패: {exc}")
+            return
+        if self._scene.background_error:
+            self.logMessage.emit(f"[FlowGym] {self._scene.background_error}")
+
+        self._shot = shot
+        self._save.setEnabled(True)
+        self._show(shot)
+        self._scene_view.refresh()
+
+    def _show(self, shot: Shot) -> None:
+        gt = shot.gt
+        camera = shot.first.camera
+        stats = gt.stats()
+
+        warped = flow_gt.warp_back(shot.second.color, gt.flow)
+        error = flow_gt.photometric_error(shot.first.color, warped, gt.valid)
+        magnitude = np.linalg.norm(gt.flow, axis=2)
+        top = float(np.percentile(magnitude[gt.surface], 99)) if gt.surface.any() else 1.0
+
+        self._panes["사진 1"].set_image(shot.first.color)
+        self._panes["사진 2"].set_image(shot.second.color)
+        self._panes["flow"].set_image(flow_gt.flow_to_color(gt.flow, gt.surface, top))
+        self._panes["flow"].set_caption(f"flow  (채도 최대 = {top:.1f}px)")
+        self._panes["마스크"].set_image(flow_gt.mask_picture(gt))
+        self._panes["마스크"].set_caption("마스크  (초록 = 유효, 빨강 = 가려짐)")
+        self._panes["되돌린 사진 2"].set_image(warped)
+        self._panes["색 오차"].set_image(
+            flow_gt.scalar_to_color(error, gt.valid, 0.0, ERROR_RANGE)
+        )
+        self._panes["색 오차"].set_caption(f"색 오차  (0 ~ {ERROR_RANGE:.0f} 계조)")
+
+        self._camera_info.setText(
+            f"{camera.width}x{camera.height}  f={camera.fx:.1f}px"
+        )
+        if "flow_mean" not in stats:
+            self._stats.setText("유효한 픽셀이 없습니다 — 얼굴과 배경이 모두 화면 밖입니다")
+            return
+        mean_error = float(error[gt.valid].mean())
+        self._stats.setText(
+            f"유효 {stats['valid'] * 100:.1f}%   가려짐 {stats['occluded'] * 100:.1f}%   "
+            f"표면 없음 {(1 - stats['surface']) * 100:.1f}%      "
+            f"flow 크기 {stats['flow_min']:.1f} ~ {stats['flow_max']:.1f}px "
+            f"(평균 {stats['flow_mean']:.1f},  u {stats['u_mean']:+.1f} / "
+            f"v {stats['v_mean']:+.1f})      "
+            f"깊이 {stats['depth_min']:.0f} ~ {stats['depth_max']:.0f}mm      "
+            f"되돌림 색 오차 평균 {mean_error:.2f} 계조"
+        )
+
+    # ── 저장 ──────────────────────────────────────────────────────────────
+    def _save_shot(self) -> None:
+        if self._shot is None or self._record is None:
+            return
+        parent = PATHS.flow / self._record.record_id
+        index = 0
+        while (parent / f"{index:04d}").exists():
+            index += 1
+        target = parent / f"{index:04d}"
+        try:
+            flow_gt.save_sample(
+                target, self._shot.first, self._shot.second, self._shot.gt,
+                dict(record=self._record.record_id, source=str(self._record.path),
+                     params=self._shot.params.as_dict()),
+            )
+        except OSError as exc:
+            self.logMessage.emit(f"[FlowGym] 저장 실패: {exc}")
+            return
+        self.logMessage.emit(f"[FlowGym] 저장: {target}")
