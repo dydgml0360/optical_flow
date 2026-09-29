@@ -51,9 +51,24 @@ uv run main
 ## 준비
 
 ```
+git clone git@github.com:dydgml0360/optical_flow.git optical_flow_gym
+cd optical_flow_gym
+git submodule update --init                                   # --recursive 쓰지 말 것 (아래)
+git -C thirdparty/depth submodule update --init external/ml   # u2net onnx 가중치
 uv sync                             # UI (python 3.10 + PySide6)
 uv sync --project thirdparty/depth  # 재구성용 depth venv (open3d/torch/onnxruntime)
 ```
+
+- `--recursive` / `--recurse-submodules` 는 **실패한다.** upstream depth 에
+  `external/stereo_models/FoundationStereo` 가 `.gitmodules` 항목 없이 gitlink 로만 남아
+  있어 `No url found for submodule path` 로 중단되고, 그 바람에 `external/ml` 도
+  체크아웃되지 않는다. 위처럼 두 단계로 나눠 받는다.
+- 서브모듈은 비공개(`RejuvenorTeam/DepthEstimation`, `RejuvenorTeam/ml`)라 그쪽 접근
+  권한이 있는 SSH 키가 필요하다.
+- 데이터셋은 저장소에 없다. `../dataset/raw/` 를 따로 옮겨 놓거나 `OFGYM_DATASET` 으로
+  위치를 지정한다. 없어도 UI 는 뜬다 (목록이 빌 뿐).
+- uv 는 `exclude-newer = "P3D"` (상대 기간) 를 읽을 수 있는 버전이어야 한다. 0.12.7 에서
+  확인.
 
 `3D 생성` 은 `thirdparty/depth/.venv` 를 서브프로세스로 부른다 — UI 와 재구성의
 의존성(PySide6 ↔ open3d 0.18/torch)을 한 인터프리터에 섞지 않기 위해서다.
