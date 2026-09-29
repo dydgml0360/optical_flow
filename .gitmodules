@@ -1,0 +1,4 @@
+[submodule "thirdparty/depth"]
+	path = thirdparty/depth
+	url = git@github.com:RejuvenorTeam/DepthEstimation.git
+	branch = dev

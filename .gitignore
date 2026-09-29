@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
+.pytest_cache/
+
+# 산출물 (데이터셋 본체는 ../dataset 에 있어 저장소 밖이다)
+outputs/
+runs/
+*.log

@@ -1,0 +1,26 @@
+[project]
+name = "optical-flow-gym"
+version = "0.1.0"
+description = "CREStereo/RAFT 계열 optical flow·stereo 모델 파인튜닝 워크벤치"
+readme = "README.md"
+# thirdparty/depth (depth-estimation) 가 3.10 고정이라 맞춘다.
+requires-python = "==3.10.*"
+dependencies = [
+    "pyside6==6.8.0.2",
+    "numpy==1.26.1",
+    "opencv-python>=4.11.0.86",
+    "pyyaml",
+]
+
+[project.scripts]
+main = "ofgym.app:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ofgym"]
+
+[tool.uv]
+exclude-newer = "P3D"
