@@ -32,7 +32,7 @@ class Paths:
     gt: Path       # 생성된 disparity ground truth
     flow: Path     # 합성 촬영 쌍 + optical flow ground truth
     shared: Path   # 디바이스 UI 가 남긴 record (아틀라스 + 정점맵) 공유 폴더
-    runs: Path
+    runs: Path     # 파인튜닝 실행 폴더들 (체크포인트, 비교 결과)
     depth: Path
 
     @classmethod
@@ -46,7 +46,7 @@ class Paths:
             gt=dataset / "gt",
             flow=dataset / "flow",
             shared=_env_path("OFGYM_SHARED", (REPO_ROOT / ".." / "shared").resolve()),
-            runs=REPO_ROOT / "runs",
+            runs=_env_path("OFGYM_RUNS", REPO_ROOT / "runs"),
             depth=REPO_ROOT / "thirdparty" / "depth",
         )
 
